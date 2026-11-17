@@ -1,6 +1,7 @@
 import { api, inTauri, onFileDrop, onHwReady, onQueue } from "./api";
 import { baseName, fmtBytes, fmtDuration } from "./format";
-import type { AppInfo, Job, MediaInfo, Preset, Settings } from "./types";
+import type { Preset as PresetT } from "./types";
+import type { AppInfo, AudioChoice, Job, MediaInfo, Preset, Settings } from "./types";
 
 export type Tab = "current" | "active" | "completed";
 export type PendingOutput = { uid: number; presetId: string };
@@ -13,7 +14,28 @@ export type Source = {
   /** In / out points in seconds (null = start / end of file). */
   inPt: number | null;
   outPt: number | null;
+  /** Which audio stream, copy/convert/remove, downmix — applies to every output of this file. */
+  audio: AudioChoice;
 };
+
+export const defaultAudio = (): AudioChoice => ({ stream: null, mode: "encode", channels: null });
+
+/** Mirrors cs_ffmpeg::audio::copy_ok so problems show before a job is queued. */
+export function copyOk(container: string, codec: string): boolean {
+  const pcm = codec.startsWith("pcm_");
+  switch (container) {
+    case "mkv": return true;
+    case "mp4": return ["aac", "mp3", "opus", "ac3", "eac3", "flac"].includes(codec);
+    case "mov": return ["aac", "mp3", "ac3"].includes(codec) || pcm;
+    case "webm": return ["opus", "vorbis"].includes(codec);
+    case "m4a": return codec === "aac";
+    case "opus": return codec === "opus";
+    case "flac": return codec === "flac";
+    case "wav": return pcm;
+    case "mp3": return codec === "mp3";
+    default: return false;
+  }
+}
 
 let uid = 1;
 
@@ -81,8 +103,27 @@ class App {
   job = $derived(this.jobs.find((j) => j.id === this.selectedJob) ?? null);
   ffmpegMissing = $derived(this.info !== null && this.info.ffmpeg_path === null);
   outputCount = $derived(this.sources.reduce((n, s) => n + (s.info ? s.outputs.length : 0), 0));
+  /** First audio setting that cannot work with the chosen outputs (same rules as the backend). */
+  audioProblem = $derived.by(() => {
+    for (const s of this.sources) {
+      if (!s.info) continue;
+      const a = s.audio, streams = s.info.audio_streams;
+      for (const o of s.outputs) {
+        const p = this.preset(o.presetId);
+        if (!p) continue;
+        if (a.mode === "none" && !p.video) return `${s.name}: "${p.name}" is audio-only, so the audio cannot be removed`;
+        if (a.mode === "copy") {
+          const st = streams[a.stream ?? 0];
+          if (!st) return `${s.name}: there is no audio to copy`;
+          if (!copyOk(p.container, st.codec)) return `${s.name}: the original ${st.codec} audio cannot be copied into .${p.container} — choose Convert`;
+        }
+      }
+    }
+    return "";
+  });
   startHint = $derived.by(() => {
     if (this.ffmpegMissing) return "FFmpeg was not found";
+    if (this.audioProblem) return this.audioProblem;
     if (this.busy) return "Adding jobs…";
     if (this.sources.length === 0) return "Add a file first";
     if (!this.sources.some((s) => s.info)) return "None of the files could be read";
@@ -204,7 +245,7 @@ class App {
       const results = await api.probeFiles(fresh.slice(0, 300));
       let failed = 0;
       for (const r of results) {
-        const src: Source = { path: r.path, name: baseName(r.path), info: r.info, error: r.error, outputs: [], inPt: null, outPt: null };
+        const src: Source = { path: r.path, name: baseName(r.path), info: r.info, error: r.error, outputs: [], inPt: null, outPt: null, audio: defaultAudio() };
         if (r.info) src.outputs.push({ uid: uid++, presetId: this.defaultPresetFor(r.info) });
         else failed++;
         this.sources.push(src);
@@ -282,7 +323,7 @@ class App {
       if (!s.info) { remaining.push(s); continue; }
       for (const o of s.outputs) {
         try {
-          ids.push(await api.addJob(s.path, o.presetId, this.dest, s.inPt, s.outPt));
+          ids.push(await api.addJob(s.path, o.presetId, this.dest, s.inPt, s.outPt, s.audio));
           ok++;
         } catch (e) {
           errors.push(`${s.name}: ${e}`);
@@ -334,6 +375,29 @@ class App {
     await this.settingsChain;
   }
 
+  /** Output size estimate in bytes, or null when it cannot be predicted (quality-based video). */
+  estimate(preset: PresetT, info: MediaInfo, inPt: number | null, outPt: number | null, audio: AudioChoice): number | null {
+    const dur = (outPt ?? info.duration_secs ?? 0) - (inPt ?? 0);
+    if (!(dur > 0)) return null;
+    let bits = 0;
+    if (preset.video) {
+      if (preset.video.rate.mode !== "bitrate") return null;
+      bits += preset.video.rate.value * 1000 * dur;
+    }
+    const st = info.audio_streams[audio.stream ?? 0];
+    if (audio.mode !== "none" && st) {
+      if (audio.mode === "copy") {
+        if (!st.bit_rate) return null;
+        bits += st.bit_rate * dur;
+      } else if (preset.audio) {
+        if (preset.audio.codec === "pcm24") bits += 48000 * 24 * (audio.channels ?? preset.audio.channels ?? st.channels) * dur;
+        else if (preset.audio.bitrate_kbps) bits += preset.audio.bitrate_kbps * 1000 * dur;
+        else return null; // lossless FLAC: depends on the content
+      }
+    }
+    return bits > 0 ? bits / 8 : null;
+  }
+
   elapsed(j: Job): number | null {
     if (!j.started_ms) return null;
     const end = j.finished_ms ?? this.now;
@@ -353,6 +417,7 @@ class App {
       j.source_size != null ? `Source size: ${fmtBytes(j.source_size)}` : "",
       v ? `Output size: ${fmtBytes(v.size_bytes)}  duration ${fmtDuration(v.duration_secs)}  ${v.video_codec ?? "no video"} ${v.width ? `${v.width}x${v.height}` : ""}  ${v.audio_codec ?? "no audio"}` : "",
       v ? `Verified:    ${v.ok ? "yes" : "NO — " + v.notes.join("; ")}` : "",
+      v?.sha256 ? `SHA-256:     ${v.sha256}` : "",
       j.note ? `Note:        ${j.note}` : "",
       this.elapsed(j) != null ? `Elapsed:     ${fmtDuration(this.elapsed(j))}` : "",
       j.cmdline ? `\nCommand:\n${j.cmdline}` : "",

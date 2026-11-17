@@ -7,16 +7,15 @@ Drag in video or audio files, pick one or more outputs for each file, press **St
 conversion with [FFmpeg](https://ffmpeg.org) and uses your GPU when it works.
 
 ## Features
-- Add files by dialog (Ctrl+O) or drag-and-drop; shows codec, size, frame rate, audio and duration.
-- 16 built-in presets: H.264, HEVC (also "smaller file" variants), AV1, VP9, ProRes 422/4444, FFV1, and AAC / Opus / MP3 / FLAC / WAV audio.
-- Several outputs per file; destination folder or next to the source; file-name template and overwrite policy (keep both / skip / replace).
-- In/Out trim: set points with **I** / **O**, buttons or typed times; only that range is exported.
-- Custom presets (container, codec, quality or bitrate, max height, frame rate, audio) with JSON import/export.
-- Queue with 1–4 jobs at a time; per job: progress, fps, speed, elapsed, time left, which encoder is used, cancel, retry, remove; pause/resume the queue; the queue survives restarts.
-- After each export Squeeze re-reads the file with ffprobe and shows **✓ Verified** or what is wrong, plus the size change (and warns when the output is bigger than the source). Each job keeps its exact FFmpeg command and output; "Copy report" puts it on the clipboard.
-- Automatic GPU encoding (NVIDIA NVENC, AMD AMF, Intel Quick Sync) with automatic software fallback.
-- Resizable panels (drag the dividers; double-click resets; saved), frame preview with a scrubber, dark and light themes. Keyboard: Ctrl+O add, Ctrl+Enter start, Delete remove, I / O in / out.
-- No account, no telemetry, no network access.
+- Add files by dialog (Ctrl+O) or drag-and-drop. The inspector shows codec, profile/level, frame rate (constant or variable), bit depth, colour/HDR, timecode, every audio stream and subtitle track.
+- 16 built-in presets (H.264, HEVC, AV1, VP9, ProRes, FFV1, AAC/Opus/MP3/FLAC/WAV). Presets the installed FFmpeg cannot run are greyed out with the reason.
+- Custom presets with advanced settings (10-bit, encoder effort, keyframe interval, two-pass, H.264 profile/level); import/export JSON, duplicate, favourites; old preset files are migrated.
+- Audio per file: pick the stream, copy the original untouched, convert, remove, or downmix.
+- Several outputs per file; in/out trim (**I** / **O**); destination, file-name template, overwrite policy, optional metadata removal.
+- Queue with 1–4 parallel jobs, progress that never goes backwards, ETA, cancel/retry, survives restarts.
+- Every export is re-read with ffprobe: **✓ Verified** or what is wrong, size change, SHA-256, exact FFmpeg command, copyable report, delivery manifest (JSON), and an A/B frame comparison of source vs output.
+- GPU encoding (NVENC / AMF / Quick Sync) with automatic software fallback.
+- Resizable panels, frame preview, dark and light themes. No account, no telemetry, no network access.
 
 See [docs/STATUS.md](docs/STATUS.md) for what is done, tested and still missing.
 

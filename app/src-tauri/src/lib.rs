@@ -1,9 +1,10 @@
 //! Squeeze desktop shell: thin, validated bridge between the UI and the Rust engines.
 
 use base64::Engine as _;
-use cs_ffmpeg::{builtin_presets, detect_hw, ffmpeg_version, list_encoders, preview_frame, unavailable_reason, HwKind, Preset, RunError};
+use cs_ffmpeg::audio::validate as validate_audio;
+use cs_ffmpeg::{builtin_presets, AudioChoice, detect_hw, ffmpeg_version, list_encoders, preview_frame, unavailable_reason, HwKind, Preset, RunError};
 use cs_probe::{locate_tool, probe, validate_input, MediaInfo};
-use cs_queue::{write_atomic, Encoder, Event, FfmpegEncoder, Job, NewJob, Queue, Report, Settings};
+use cs_queue::{manifest_json, write_atomic, Encoder, Event, FfmpegEncoder, Job, NewJob, Queue, Report, Settings};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -133,6 +134,20 @@ fn save_custom_preset(state: State<'_, AppState>, mut preset: Preset) -> Result<
     Ok(all_presets(&state))
 }
 
+/// Copy any preset (built-in or custom) into the Custom group so it can be edited.
+#[tauri::command]
+fn duplicate_preset(state: State<'_, AppState>, id: String) -> Result<Vec<Preset>, String> {
+    let src = all_presets(&state).into_iter().find(|p| p.id == id).ok_or("unknown preset")?;
+    let taken: std::collections::HashSet<String> = all_presets(&state).into_iter().map(|p| p.id).collect();
+    let base: String = format!("custom-{}", src.id.trim_start_matches("custom-")).chars().take(52).collect();
+    let new_id = (1..1000).map(|n| if n == 1 { format!("{base}-copy") } else { format!("{base}-copy-{n}") }).find(|c| !taken.contains(c)).ok_or("too many copies")?;
+    let mut copy = src;
+    copy.id = new_id;
+    copy.group = "Custom".into();
+    copy.name = format!("{} copy", copy.name).chars().take(80).collect();
+    save_custom_preset(state, copy)
+}
+
 #[tauri::command]
 fn delete_custom_preset(state: State<'_, AppState>, id: String) -> Result<Vec<Preset>, String> {
     state.custom.lock().unwrap().retain(|p| p.id != id);
@@ -225,6 +240,7 @@ async fn add_job(
     dest_dir: Option<String>,
     start_secs: Option<f64>,
     end_secs: Option<f64>,
+    audio: Option<AudioChoice>,
 ) -> Result<u64, String> {
     if state.queue.jobs().len() >= MAX_JOBS {
         return Err("queue is full".into());
@@ -238,11 +254,23 @@ async fn add_job(
     }
     let ffprobe = state.ffprobe.clone();
     let src = source.clone();
-    let duration = tauri::async_runtime::spawn_blocking(move || ffprobe.and_then(|t| probe(&t, Path::new(&src)).ok()).and_then(|i| i.duration_secs))
-        .await
-        .map_err(|e| e.to_string())?;
+    let audio = audio.unwrap_or_default();
+    let (preset_c, audio_c) = (preset.clone(), audio.clone());
+    let duration = tauri::async_runtime::spawn_blocking(move || -> Result<Option<f64>, String> {
+        let Some(tool) = ffprobe else { return Ok(None) };
+        match probe(&tool, Path::new(&src)) {
+            Ok(info) => {
+                validate_audio(&preset_c, &info, &audio_c)?;
+                Ok(info.duration_secs)
+            }
+            Err(_) if audio_c.is_default() => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     let settings = state.settings.lock().unwrap().clone();
-    state.queue.add(NewJob { source, duration_secs: duration, preset, dest_dir, template: None, overwrite: None, start_secs, end_secs }, &settings)
+    state.queue.add(NewJob { source, duration_secs: duration, preset, dest_dir, template: None, overwrite: None, start_secs, end_secs, audio, strip_metadata: None }, &settings)
 }
 
 #[tauri::command]
@@ -296,6 +324,24 @@ fn set_settings(state: State<'_, AppState>, settings: Settings) -> Result<Settin
     Ok(s)
 }
 
+/// Save a delivery manifest (JSON) of all finished jobs: sources, outputs, sizes, checks and SHA-256.
+/// The save location comes from a Rust-side dialog, never from the web page.
+#[tauri::command]
+async fn export_manifest(app: AppHandle, state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let jobs = state.queue.jobs();
+    if !jobs.iter().any(|j| j.state == cs_queue::JobState::Done) {
+        return Err("There are no finished jobs to list yet.".into());
+    }
+    let json = serde_json::to_vec_pretty(&manifest_json(&jobs, env!("CARGO_PKG_VERSION"))).map_err(|e| e.to_string())?;
+    let app2 = app.clone();
+    let chosen = tauri::async_runtime::spawn_blocking(move || app2.dialog().file().set_file_name("squeeze-manifest.json").add_filter("Manifest", &["json"]).blocking_save_file())
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(path) = chosen.and_then(|p| p.into_path().ok()) else { return Ok(None) };
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
 /// Show a finished output in the file manager. Only paths of known finished jobs are accepted.
 #[tauri::command]
 fn reveal_output(state: State<'_, AppState>, id: u64) -> Result<(), String> {
@@ -320,10 +366,11 @@ pub fn run() {
                 .and_then(|t| serde_json::from_str(&t).ok())
                 .unwrap_or_default();
             let settings = Arc::new(Mutex::new(settings.sanitized()));
+            // each saved preset is migrated to the current schema; unreadable ones are skipped, not fatal
             let custom: Vec<Preset> = std::fs::read_to_string(dir.join("presets.json"))
                 .ok()
-                .and_then(|t| serde_json::from_str::<Vec<Preset>>(&t).ok())
-                .map(|v| v.into_iter().filter(|p| p.validate().is_ok()).collect())
+                .and_then(|t| serde_json::from_str::<Vec<serde_json::Value>>(&t).ok())
+                .map(|v| v.into_iter().filter_map(|x| Preset::from_value(x).ok()).collect())
                 .unwrap_or_default();
 
             let mut extra: Vec<PathBuf> = vec![];
@@ -375,8 +422,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            app_info, list_presets, preset_availability, save_custom_preset, delete_custom_preset, export_preset, import_preset, pick_files, pick_folder, probe_files, preview, add_job,
-            queue_list, queue_start, queue_pause, job_cancel, queue_cancel_all, job_retry, job_remove, queue_clear_finished, get_settings, set_settings, reveal_output
+            app_info, list_presets, preset_availability, duplicate_preset, save_custom_preset, delete_custom_preset, export_preset, import_preset, pick_files, pick_folder, probe_files, preview, add_job,
+            export_manifest, queue_list, queue_start, queue_pause, job_cancel, queue_cancel_all, job_retry, job_remove, queue_clear_finished, get_settings, set_settings, reveal_output
         ])
         .build(tauri::generate_context!())
         .expect("error while building Squeeze");

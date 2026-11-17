@@ -22,7 +22,16 @@
   let acodec = $state(seed()?.audio?.codec ?? "aac");
   let abitrate = $state<number | null>(seed()?.audio?.bitrate_kbps ?? 192);
   let channels = $state<number | null>(seed()?.audio?.channels ?? null);
+  let bitDepth = $state<8 | 10>(seed()?.video?.bit_depth === 10 ? 10 : 8);
+  let speed = $state<string>(seed()?.video?.speed ?? "");
+  let keyint = $state<number | null>(seed()?.video?.keyint_secs ?? null);
+  let twoPass = $state<boolean>(seed()?.video?.two_pass ?? false);
+  let profile = $state<string>(seed()?.video?.profile ?? "");
+  let level = $state<string>(seed()?.video?.level ?? "");
   let error = $state("");
+  const lossy = $derived(["h264", "hevc", "av1", "vp9"].includes(vcodec));
+  const canTwoPass = $derived(rate === "bitrate" && ["h264", "hevc", "vp9"].includes(vcodec));
+  const levels = ["3.0", "3.1", "3.2", "4.0", "4.1", "4.2", "5.0", "5.1", "5.2", "6.0", "6.1", "6.2"];
 
   const id = $derived(initial?.id ?? ("custom-" + (name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "preset")));
 
@@ -35,7 +44,15 @@
     error = "";
     const preset: Preset = {
       id, name: name.trim(), group: "Custom", container,
-      video: mode === "video" ? { codec: vcodec, rate: { mode: rate, value: Number(rateValue) }, max_height: height ? Number(height) : null, fps: fps ? Number(fps) : null } : null,
+      video: mode === "video" ? {
+        codec: vcodec, rate: { mode: rate, value: Number(rateValue) }, max_height: height ? Number(height) : null, fps: fps ? Number(fps) : null,
+        bit_depth: lossy && bitDepth === 10 ? 10 : null,
+        keyint_secs: keyint ? Number(keyint) : null,
+        speed: lossy && speed ? (speed as "fast" | "medium" | "slow") : null,
+        two_pass: lossy && canTwoPass && twoPass,
+        profile: vcodec === "h264" && bitDepth !== 10 && profile ? profile : null,
+        level: vcodec === "h264" && level ? level : null,
+      } : null,
       audio: { codec: acodec, bitrate_kbps: abitrate ? Number(abitrate) : null, channels: channels ? Number(channels) : null },
     };
     if (mode === "video" && ["prores422", "prores4444", "ffv1"].includes(vcodec)) preset.video!.rate = { mode: "crf", value: 0 };
@@ -72,6 +89,28 @@
     <label>Max height (px, empty = keep) <input type="number" min="144" max="8640" bind:value={height} /></label>
     <label>Frame rate (empty = keep) <input type="number" min="1" max="240" step="0.001" bind:value={fps} /></label>
   {/if}
+  {#if mode === "video" && lossy}
+    <details class="adv">
+      <summary>Advanced video settings</summary>
+      <label>Bit depth
+        <select bind:value={bitDepth}><option value={8}>8-bit (works everywhere)</option><option value={10}>10-bit (software encoder, newer players)</option></select>
+      </label>
+      <label>Encoder effort
+        <select bind:value={speed}><option value="">Default</option><option value="fast">Fast (bigger file)</option><option value="medium">Medium</option><option value="slow">Slow (smaller file)</option></select>
+      </label>
+      <label>Keyframe every (seconds, empty = automatic) <input type="number" min="0.5" max="20" step="0.5" bind:value={keyint} /></label>
+      {#if canTwoPass}<label class="chk"><input type="checkbox" bind:checked={twoPass} /> Two-pass (more accurate bitrate, takes about twice as long)</label>{/if}
+      {#if vcodec === "h264"}
+        <label>H.264 profile
+          <select bind:value={profile} disabled={bitDepth === 10}><option value="">Automatic</option><option value="baseline">Baseline</option><option value="main">Main</option><option value="high">High</option></select>
+        </label>
+        <label>H.264 level
+          <select bind:value={level}><option value="">Automatic</option>{#each levels as l}<option value={l}>{l}</option>{/each}</select>
+        </label>
+      {/if}
+      <p class="tip">These settings use the software encoder, so the GPU is skipped for presets that set them.</p>
+    </details>
+  {/if}
   <label>Audio codec <select bind:value={acodec}>{#each acodecs as [v, l]}<option value={v}>{l}</option>{/each}</select></label>
   <label>Audio bitrate kbit/s <input type="number" min="16" max="1536" bind:value={abitrate} /></label>
   <label>Channels (empty = keep) <input type="number" min="1" max="8" bind:value={channels} /></label>
@@ -91,6 +130,11 @@
   .inline { display: flex; gap: 8px; }
   .inline input { width: 110px; }
   .err { color: var(--danger); margin: 0; }
+  .adv { border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; display: grid; gap: 8px; }
+  .adv summary { cursor: pointer; color: var(--text); }
+  .adv[open] summary { margin-bottom: 4px; }
+  .chk { display: flex; align-items: center; gap: 6px; }
+  .tip { margin: 0; color: var(--faint); font-size: 11px; }
   .acts { display: flex; justify-content: flex-end; gap: 8px; }
   .acts button { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 6px 16px; }
   .acts .primary { background: var(--accent); color: var(--accent-ink); border: 0; font-weight: 600; }

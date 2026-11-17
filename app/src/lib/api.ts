@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import type { AppInfo, Job, Preset, ProbeResult, QueueEvent, Settings } from "./types";
+import type { AppInfo, AudioChoice, Job, Preset, ProbeResult, QueueEvent, Settings } from "./types";
 
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -10,6 +10,7 @@ export const api = {
   listPresets: () => invoke<Preset[]>("list_presets"),
   presetAvailability: () => invoke<Record<string, string>>("preset_availability"),
   saveCustomPreset: (preset: Preset) => invoke<Preset[]>("save_custom_preset", { preset }),
+  duplicatePreset: (id: string) => invoke<Preset[]>("duplicate_preset", { id }),
   deleteCustomPreset: (id: string) => invoke<Preset[]>("delete_custom_preset", { id }),
   exportPreset: (id: string) => invoke<boolean>("export_preset", { id }),
   importPreset: () => invoke<Preset[]>("import_preset"),
@@ -17,8 +18,8 @@ export const api = {
   pickFolder: () => invoke<string | null>("pick_folder"),
   probeFiles: (paths: string[]) => invoke<ProbeResult[]>("probe_files", { paths }),
   preview: (path: string, secs: number) => invoke<string>("preview", { path, secs }),
-  addJob: (source: string, presetId: string, destDir: string | null, startSecs: number | null = null, endSecs: number | null = null) =>
-    invoke<number>("add_job", { source, presetId, destDir, startSecs, endSecs }),
+  addJob: (source: string, presetId: string, destDir: string | null, startSecs: number | null = null, endSecs: number | null = null, audio: AudioChoice | null = null) =>
+    invoke<number>("add_job", { source, presetId, destDir, startSecs, endSecs, audio }),
   queueList: () => invoke<Job[]>("queue_list"),
   queueStart: () => invoke<void>("queue_start"),
   queuePause: () => invoke<void>("queue_pause"),
@@ -29,6 +30,7 @@ export const api = {
   queueClearFinished: () => invoke<void>("queue_clear_finished"),
   getSettings: () => invoke<Settings>("get_settings"),
   setSettings: (settings: Settings) => invoke<Settings>("set_settings", { settings }),
+  exportManifest: () => invoke<string | null>("export_manifest"),
   revealOutput: (id: number) => invoke<void>("reveal_output", { id }),
 };
 

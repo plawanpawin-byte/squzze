@@ -18,6 +18,21 @@
     ((app.settings?.template || "{name}-{preset}").replace("{name}", "clip").replace("{preset}", "h264-1080")).replace(/[\\/:*?"<>|]/g, "_") + ".mp4",
   );
 
+  const favs = $derived(app.settings?.favorites ?? []);
+  const favorites = $derived(favs.map((id) => app.presets.find((p) => p.id === id)).filter((p): p is Preset => !!p && match(p)));
+  const isFav = (id: string) => favs.includes(id);
+  function toggleFav(id: string) {
+    app.setSetting({ favorites: isFav(id) ? favs.filter((x) => x !== id) : [...favs, id] });
+  }
+  async function duplicate(id: string) {
+    const p = await app.run(() => api.duplicatePreset(id));
+    if (p) {
+      app.presets = p;
+      open.Custom = true;
+      app.say("Copied to Custom — edit it with ✎");
+    }
+  }
+
   function add(id: string) {
     picked = id;
     app.addOutput(id);
@@ -36,6 +51,19 @@
 
   <div class="body">
     {#if side === "Presets"}
+      {#if favorites.length}
+        <div class="sect">Favourites</div>
+        <ul class="tree">
+          {#each favorites as it (it.id)}
+            <li class="row" class:picked={picked === it.id}>
+              <button class="leaf" class:off={!!app.unavailable[it.id]} title={app.unavailable[it.id] ?? "Click to add this output to the selected file"} onclick={() => add(it.id)}>
+                <span class="ico {it.video ? 'film' : 'wave'}" aria-hidden="true"></span>{it.name}
+              </button>
+              <button class="mini on" aria-label="Remove {it.name} from favourites" title="Unstar" onclick={() => toggleFav(it.id)}>★</button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
       <div class="sect">Built-in</div>
       <ul class="tree">
         {#each groups as g}
@@ -48,9 +76,11 @@
               <ul>
                 {#each g.items as it (it.id)}
                   <li class="row" class:picked={picked === it.id}>
-                    <button class="leaf" class:off={!!app.unavailable[it.id]} title={app.unavailable[it.id] ?? "Click to add this output to the selected file"} aria-disabled={!!app.unavailable[it.id]} onclick={() => add(it.id)}>
+                    <button class="leaf" class:off={!!app.unavailable[it.id]} title={app.unavailable[it.id] ?? `${it.name} — click to add this output to the selected file`} aria-disabled={!!app.unavailable[it.id]} onclick={() => add(it.id)}>
                       <span class="ico {it.video ? 'film' : 'wave'}" aria-hidden="true"></span>{it.name}{#if app.unavailable[it.id]}<span class="na"> · not available</span>{/if}
                     </button>
+                    <button class="mini hov" class:on={isFav(it.id)} aria-label="{isFav(it.id) ? 'Remove' : 'Add'} {it.name} {isFav(it.id) ? 'from' : 'to'} favourites" title="Favourite" onclick={() => toggleFav(it.id)}>{isFav(it.id) ? "★" : "☆"}</button>
+                    <button class="mini hov" aria-label="Duplicate {it.name}" title="Duplicate to Custom" onclick={() => duplicate(it.id)}>⧉</button>
                   </li>
                 {/each}
               </ul>
@@ -63,7 +93,9 @@
         {#each custom as it (it.id)}
           <li class="row" class:picked={picked === it.id}>
             <button class="leaf" onclick={() => add(it.id)}><span class="ico {it.video ? 'film' : 'wave'}" aria-hidden="true"></span>{it.name}</button>
+            <button class="mini hov" class:on={isFav(it.id)} aria-label="{isFav(it.id) ? 'Remove' : 'Add'} {it.name} {isFav(it.id) ? 'from' : 'to'} favourites" title="Favourite" onclick={() => toggleFav(it.id)}>{isFav(it.id) ? "★" : "☆"}</button>
             <button class="mini" aria-label="Edit {it.name}" title="Edit" onclick={() => onedit(it)}>✎</button>
+            <button class="mini" aria-label="Duplicate {it.name}" title="Duplicate" onclick={() => duplicate(it.id)}>⧉</button>
             <button class="mini" aria-label="Export {it.name}" title="Export" onclick={() => app.run(() => api.exportPreset(it.id))}>⇪</button>
             <button class="mini" aria-label="Delete {it.name}" title="Delete" onclick={async () => { const p = await app.run(() => api.deleteCustomPreset(it.id)); if (p) app.presets = p; }}>✕</button>
           </li>
@@ -104,6 +136,8 @@
               <option value="replace">Replace the old file</option>
             </select>
           </label>
+          <label class="chk"><input type="checkbox" checked={app.settings.strip_metadata} onchange={(e) => app.setSetting({ strip_metadata: e.currentTarget.checked })} aria-label="Remove metadata from outputs" /> Remove metadata (title, location, camera info)</label>
+          <p class="hint tight">Off by default: tags from the source are copied to the output.</p>
           {#if app.settings.overwrite === "replace"}<p class="hint tight warnc">Existing files with the same name will be overwritten. The source file is never overwritten.</p>{/if}
         </div>
       {/if}
@@ -144,12 +178,16 @@
   .ico.wave { background: repeating-linear-gradient(90deg, var(--muted) 0 1.5px, transparent 1.5px 3.5px); mask: linear-gradient(transparent 20%, #000 20% 80%, transparent 80%); }
   .mini { background: none; border: 0; color: var(--muted); padding: 2px 4px; border-radius: 4px; }
   .mini:hover { color: var(--text); background: var(--panel-2); }
+  .mini.on { color: var(--marker); }
+  .row .mini.hov { visibility: hidden; }
+  .row:hover .mini.hov, .row .mini.hov.on, .row:focus-within .mini.hov { visibility: visible; }
   .empty, .hint { color: var(--faint); padding: 3px 8px; list-style: none; }
   .foot { display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-top: 1px solid var(--line-soft); }
   .search { flex: 1; min-width: 0; }
   .form { display: grid; gap: 8px; padding: 2px 8px 10px; }
   .form label { display: grid; gap: 3px; color: var(--muted); }
   .form .field { width: 100%; }
+  .form .chk { display: flex; gap: 6px; align-items: flex-start; }
   .tight { padding: 0; margin: -2px 0 0; font-size: 11px; line-height: 1.4; }
   .warnc { color: var(--warn); }
   code { background: var(--panel-3); border-radius: 3px; padding: 0 3px; }

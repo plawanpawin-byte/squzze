@@ -2,10 +2,12 @@
   import { app } from "$lib/app.svelte";
   import { api } from "$lib/api";
   import { fmtBytes, fmtDuration, fmtEta } from "$lib/format";
+  import Compare from "./Compare.svelte";
   import type { Job } from "$lib/types";
 
   let { jobs, kind }: { jobs: Job[]; kind: "active" | "completed" } = $props();
   let open = $state<Record<number, boolean>>({});
+  let cmp = $state<Record<number, boolean>>({});
   const label: Record<string, string> = { queued: "Waiting", running: "Encoding", done: "Done", failed: "Failed", cancelled: "Cancelled" };
 
   $effect(() => {
@@ -51,6 +53,7 @@
     {:else}
       <div class="sum"><strong>{okCount} done</strong>{#if badCount}<span class="bad"> · {badCount} failed</span>{/if}<span class="muted"> · {jobs.length} total</span></div>
       <span class="grow"></span>
+      <button class="btn" disabled={!okCount} title="Save a JSON list of what was made, with sizes, checks and SHA-256" onclick={async () => { const p = await app.run(api.exportManifest); if (p) app.say(`Manifest saved: ${p}`); }}>Export manifest…</button>
       <button class="btn" disabled={!jobs.length} onclick={() => app.run(api.queueClearFinished)}>Clear finished</button>
     {/if}
   </div>
@@ -115,6 +118,7 @@
           {#if d?.worse}<div class="problem soft">The output is larger than the source — it was already well compressed. Try a “smaller file” preset or HEVC.</div>{/if}
           {#if j.note}<div class="path">{j.note}</div>{/if}
           {#if j.output}<div class="path" title={j.output}>{j.output}</div>{/if}
+          {#if j.verify?.sha256}<div class="path" title="SHA-256 of the exported file">SHA-256 {j.verify.sha256.slice(0, 16)}…</div>{/if}
         {:else if j.error}
           <div class="problem">{j.error}</div>
         {/if}
@@ -128,6 +132,9 @@
           {/if}
           {#if j.state === "done"}
             <button class="btn" onclick={() => app.run(() => api.revealOutput(j.id))}>Show in folder</button>
+            {#if j.preset.video && j.output}
+              <button class="btn" onclick={() => (cmp[j.id] = !cmp[j.id])} aria-expanded={!!cmp[j.id]}>Compare {cmp[j.id] ? "▴" : "▾"}</button>
+            {/if}
           {/if}
           {#if j.state !== "queued"}
             <button class="btn" onclick={() => (open[j.id] = !open[j.id])} aria-expanded={!!open[j.id]}>Details {open[j.id] ? "▴" : "▾"}</button>
@@ -140,6 +147,9 @@
             <button class="btn" onclick={() => app.run(() => api.jobRemove(j.id))}>Remove</button>
           {/if}
         </div>
+        {#if cmp[j.id] && j.output}
+          <Compare job={j} />
+        {/if}
         {#if open[j.id]}
           <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
           <pre class="details" tabindex="0">{app.report(j)}</pre>

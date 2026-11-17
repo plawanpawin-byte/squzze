@@ -1,6 +1,6 @@
 //! Persistent job queue: scheduler, worker threads, cancel/retry and the FFmpeg-backed encoder.
 
-use cs_ffmpeg::{build_args_trim, plan_output, run_encode_logged, temp_path, verify_output, HwKind, Overwrite, PlanError, Preset, Progress, RunError, Trim, Verify};
+use cs_ffmpeg::{build_args_full, build_args_pass, plan_output, sha256_file, strip_metadata, run_encode_logged, temp_path, verify_output_with, AudioChoice, AudioMode, HwKind, Overwrite, PlanError, Preset, Progress, RunError, Trim, Verify};
 use cs_probe::{probe, validate_input};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -61,6 +61,12 @@ pub struct Job {
     /// What ffprobe found in the finished output compared with the preset.
     #[serde(default)]
     pub verify: Option<Verify>,
+    /// Which audio stream, copy/convert/remove, downmix.
+    #[serde(default)]
+    pub audio: AudioChoice,
+    /// Do not copy tags/chapters from the source.
+    #[serde(default)]
+    pub strip_metadata: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +81,10 @@ pub struct NewJob {
     pub start_secs: Option<f64>,
     #[serde(default)]
     pub end_secs: Option<f64>,
+    #[serde(default)]
+    pub audio: AudioChoice,
+    #[serde(default)]
+    pub strip_metadata: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -84,11 +94,17 @@ pub struct Settings {
     pub default_dest: Option<String>,
     pub template: String,
     pub overwrite: Overwrite,
+    /// Preset ids the user starred (built-in or custom).
+    #[serde(default)]
+    pub favorites: Vec<String>,
+    /// Remove source tags (title, location, camera info) and chapters from every output.
+    #[serde(default)]
+    pub strip_metadata: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { max_parallel: 1, use_hw: true, default_dest: None, template: "{name}-{preset}".into(), overwrite: Overwrite::Rename }
+        Settings { max_parallel: 1, use_hw: true, default_dest: None, template: "{name}-{preset}".into(), overwrite: Overwrite::Rename, favorites: vec![], strip_metadata: false }
     }
 }
 
@@ -103,6 +119,10 @@ impl Settings {
                 self.default_dest = None;
             }
         }
+        // only plausible preset ids, no duplicates, bounded
+        let mut seen = std::collections::HashSet::new();
+        self.favorites.retain(|id| !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') && seen.insert(id.clone()));
+        self.favorites.truncate(200);
         self
     }
 }
@@ -293,6 +313,8 @@ impl Queue {
             cmdline: None,
             log: vec![],
             verify: None,
+            audio: new.audio,
+            strip_metadata: new.strip_metadata.unwrap_or(settings.strip_metadata),
         };
         g.jobs.push(job.clone());
         self.persist(&g);
@@ -426,6 +448,35 @@ fn persist(shared: &Shared, g: &Inner) {
     }
 }
 
+/// Delivery manifest for finished jobs: what was made from what, with sizes, checks and SHA-256.
+pub fn manifest_json(jobs: &[Job], app_version: &str) -> serde_json::Value {
+    let items: Vec<serde_json::Value> = jobs
+        .iter()
+        .filter(|j| j.state == JobState::Done)
+        .map(|j| {
+            let v = j.verify.as_ref();
+            serde_json::json!({
+                "source": j.source,
+                "source_size_bytes": j.source_size,
+                "range_secs": [j.start_secs, j.end_secs],
+                "preset": { "id": j.preset.id, "name": j.preset.name, "container": j.preset.container },
+                "output": j.output,
+                "output_size_bytes": v.and_then(|v| v.size_bytes),
+                "duration_secs": v.and_then(|v| v.duration_secs),
+                "video_codec": v.and_then(|v| v.video_codec.clone()),
+                "audio_codec": v.and_then(|v| v.audio_codec.clone()),
+                "verified": v.map(|v| v.ok),
+                "verify_notes": v.map(|v| v.notes.clone()).unwrap_or_default(),
+                "sha256": v.and_then(|v| v.sha256.clone()),
+                "encoder_note": j.note,
+                "started_ms": j.started_ms,
+                "finished_ms": j.finished_ms,
+            })
+        })
+        .collect();
+    serde_json::json!({ "manifest_version": 1, "generator": format!("Squeeze {app_version}"), "created": now(), "items": items })
+}
+
 fn dispatcher(shared: Arc<Shared>) {
     let mut g = shared.inner.lock().unwrap();
     let mut was_busy = false;
@@ -557,6 +608,22 @@ fn remove_quiet(p: &Path) {
     let _ = std::fs::remove_file(p);
 }
 
+fn use_hw_requested(settings: &Arc<Mutex<Settings>>) -> bool {
+    settings.lock().unwrap().use_hw
+}
+
+/// Remove x264/x265/vp9 pass-log files (`<prefix>-0.log`, `.mbtree`, `.cutree` …).
+fn remove_pass_logs(prefix: &Path) {
+    let (Some(dir), Some(name)) = (prefix.parent(), prefix.file_name().map(|n| n.to_string_lossy().into_owned())) else { return };
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&name) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
 fn quote(a: &str) -> String {
     if a.contains(' ') || a.contains('\'') { format!("\"{a}\"") } else { a.to_string() }
 }
@@ -579,19 +646,48 @@ impl Encoder for FfmpegEncoder {
             let use_hw = self.settings.lock().unwrap().use_hw;
             let list = self.hw.lock().unwrap();
             match (&job.preset.video, use_hw) {
-                (Some(v), true) => list.iter().copied().find(|k| k.encoder(v.codec).is_some()),
+                // 10-bit, two-pass, profile/level and speed are honoured exactly only by the software encoders
+                (Some(v), true) if !v.needs_software() => list.iter().copied().find(|k| k.encoder(v.codec).is_some()),
                 _ => None,
             }
         };
+        let forced_software = use_hw_requested(&self.settings) && job.preset.video.as_ref().is_some_and(|v| v.needs_software());
+        let two_pass = job.preset.video.as_ref().is_some_and(|v| v.two_pass);
         report(Report::Note(match hw_kind {
             Some(k) => format!("Encoding with {}", k.label()),
+            None if forced_software => "Encoding in software (CPU) — the advanced settings need it".into(),
             None => "Encoding in software (CPU)".into(),
         }));
         let trim = Trim { start: job.start_secs, end: job.end_secs };
+        let cmd_text = |args: &[String]| format!("ffmpeg {}", args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" "));
         let attempt = |hw: Option<HwKind>, report: &mut dyn FnMut(Report)| {
-            let args = build_args_trim(&job.preset, &src, &tmp, hw, trim);
-            report(Report::Cmd(format!("ffmpeg {}", args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" "))));
-            run_encode_logged(&self.ffmpeg, &args, job.duration_secs, cancel, |p| report(Report::Progress(p)))
+            if !two_pass {
+                let mut args = build_args_full(&job.preset, &src, &tmp, hw, trim, &job.audio);
+                if job.strip_metadata {
+                    strip_metadata(&mut args);
+                }
+                report(Report::Cmd(cmd_text(&args)));
+                return run_encode_logged(&self.ffmpeg, &args, job.duration_secs, cancel, |p| report(Report::Progress(p)));
+            }
+            // two passes: analysis (0-50 %) then the real encode (50-100 %)
+            let logp = tmp.with_extension("pass");
+            let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+            let a1 = build_args_pass(&job.preset, &src, Path::new(null), None, trim, &job.audio, Some((1, &logp)));
+            let mut a2 = build_args_pass(&job.preset, &src, &tmp, None, trim, &job.audio, Some((2, &logp)));
+            if job.strip_metadata {
+                strip_metadata(&mut a2);
+            }
+            report(Report::Cmd(format!("{}
+{}", cmd_text(&a1), cmd_text(&a2))));
+            let cleanup = || remove_pass_logs(&logp);
+            let (r1, log1) = run_encode_logged(&self.ffmpeg, &a1, job.duration_secs, cancel, |p| report(Report::Progress(Progress { percent: p.percent * 0.5, ..p })));
+            if r1.is_err() {
+                cleanup();
+                return (r1, log1);
+            }
+            let out = run_encode_logged(&self.ffmpeg, &a2, job.duration_secs, cancel, |p| report(Report::Progress(Progress { percent: 50.0 + p.percent * 0.5, ..p })));
+            cleanup();
+            out
         };
         let (mut res, mut log) = attempt(hw_kind, report);
         if let (Err(RunError::Failed(m)), Some(k)) = (&res, hw_kind) {
@@ -601,7 +697,7 @@ impl Encoder for FfmpegEncoder {
         } else if let (Ok(()), Some(k)) = (&res, hw_kind) {
             report(Report::Note(format!("Encoded with {}", k.label())));
         } else if res.is_ok() {
-            report(Report::Note("Encoded in software".into()));
+            report(Report::Note(if forced_software { "Encoded in software — the advanced settings need it".into() } else { "Encoded in software".into() }));
         }
         report(Report::Log(log));
         match res {
@@ -616,11 +712,15 @@ impl Encoder for FfmpegEncoder {
                     RunError::Failed(format!("could not write output: {e}"))
                 })?;
                 if let Some(probe_tool) = &self.ffprobe {
-                    let src_audio = probe(probe_tool, &src).map(|i| i.audio.is_some()).unwrap_or(true);
-                    let v = match probe(probe_tool, &fin) {
-                        Ok(info) => verify_output(&info, &job.preset, job.duration_secs, src_audio),
+                    let src_info = probe(probe_tool, &src).ok();
+                    let src_stream = src_info.as_ref().and_then(|i| i.audio_streams.get(job.audio.stream_index() as usize));
+                    let expect_audio = job.audio.mode != AudioMode::None && src_stream.map(|_| true).unwrap_or(src_info.is_none());
+                    let copied_codec = if job.audio.mode == AudioMode::Copy { src_stream.map(|a| a.codec.clone()) } else { None };
+                    let mut v = match probe(probe_tool, &fin) {
+                        Ok(info) => verify_output_with(&info, &job.preset, job.duration_secs, expect_audio, copied_codec.as_deref()),
                         Err(e) => Verify { ok: false, notes: vec![format!("could not read the finished file: {e}")], ..Verify::default() },
                     };
+                    v.sha256 = sha256_file(&fin).ok();
                     report(Report::Verify(v));
                 }
                 Ok(fin.to_string_lossy().into_owned())
@@ -681,7 +781,7 @@ mod tests {
     }
 
     fn newjob(p: &Path) -> NewJob {
-        NewJob { source: p.to_string_lossy().into_owned(), duration_secs: Some(1.0), preset: builtin_presets().remove(0), dest_dir: None, template: None, overwrite: None, start_secs: None, end_secs: None }
+        NewJob { source: p.to_string_lossy().into_owned(), duration_secs: Some(1.0), preset: builtin_presets().remove(0), dest_dir: None, template: None, overwrite: None, start_secs: None, end_secs: None, audio: AudioChoice::default(), strip_metadata: None }
     }
 
     fn wait_for(q: &Queue, f: impl Fn(&[Job]) -> bool) {
@@ -834,10 +934,34 @@ mod tests {
     }
 
     #[test]
+    fn manifest_lists_only_finished_jobs_with_checksums() {
+        let mk = |id: u64, state: &str| -> Job {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "source": "C:/a.mov", "file_name": "a.mov", "duration_secs": 4.0,
+                "preset": serde_json::to_value(builtin_presets().remove(0)).unwrap(),
+                "dest_dir": null, "template": "{name}", "overwrite": "rename", "state": state, "progress": 100.0,
+                "fps": null, "speed": null, "eta_secs": null, "error": null, "output": "C:/o.mp4", "note": "Encoded in software",
+                "attempt": 1, "created_at": 0, "temp": null, "source_size": 1000,
+                "verify": { "ok": true, "notes": [], "size_bytes": 500, "duration_secs": 4.0, "video_codec": "h264", "audio_codec": "aac", "width": 1280, "height": 720, "sha256": "ab".repeat(32) }
+            })).unwrap()
+        };
+        let m = manifest_json(&[mk(1, "done"), mk(2, "failed"), mk(3, "queued")], "9.9");
+        assert_eq!(m["manifest_version"], 1);
+        let items = m["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(items[0]["verified"], true);
+        assert_eq!(items[0]["output_size_bytes"], 500);
+        assert!(m["generator"].as_str().unwrap().contains("9.9"));
+    }
+
+    #[test]
     fn settings_are_clamped() {
         let s = Settings { max_parallel: 99, template: "".into(), default_dest: Some("relative".into()), ..Settings::default() }.sanitized();
         assert_eq!(s.max_parallel, 4);
         assert_eq!(s.template, "{name}-{preset}");
         assert!(s.default_dest.is_none());
+        let f = Settings { favorites: vec!["ok-id".into(), "ok-id".into(), "../bad".into(), "".into(), "x".repeat(70)], ..Settings::default() }.sanitized();
+        assert_eq!(f.favorites, vec!["ok-id".to_string()]);
     }
 }

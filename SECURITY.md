@@ -26,10 +26,15 @@ The realistic attacker is **a malicious or malformed media file / preset file** 
 | Resource exhaustion | Batch probe ≤ 300 files, queue ≤ 5000 jobs, parallel jobs ≤ 4, ffprobe 30 s timeout, preview 15 s / 4 MB cap. | `app/src-tauri/src/lib.rs`, `cs-probe`, `cs-ffmpeg` |
 | Bad in/out points | Must be finite, non-negative, out after in and inside the file; validated again in the queue before FFmpeg starts. | `cs-queue::effective_duration` |
 | Output that silently differs from the preset | Every finished file is re-probed; codec, height limit, duration and audio presence are checked and shown to the user. | `cs-ffmpeg/src/verify.rs` |
+| Unsafe or impossible audio choices | Stream index, copy-vs-container compatibility, downmix limits are validated against the probed file before a job is queued; the UI applies the same rules to block Start with the reason. | `cs-ffmpeg/src/audio.rs`, `app/src-tauri` |
+| Advanced video settings used as free-form FFmpeg options | Only enumerated values are accepted (bit depth 8/10, effort fast/medium/slow, keyframe 0.5-20 s, H.264 profile/level from fixed lists); everything becomes fixed argument pairs, never text from the user. | `cs-ffmpeg/src/preset.rs` |
+| Preset files from newer/older/garbage versions | Schema version checked (newer refused with a reason), old versions migrated, then fully validated. | `Preset::from_value` |
+| Saving the manifest anywhere | The save location comes from a Rust-side dialog; the page can only ask for it. The manifest holds only data of finished jobs. | `export_manifest` |
+| Previewing arbitrary files | Frame previews accept only existing regular files, with `-protocol_whitelist file`; output previews use the job's own output path. | `cs-probe::validate_input` |
 | Corrupt queue/settings files | Corrupt `queue.json` is set aside as `queue.corrupt.json`; invalid settings fall back to defaults and are clamped. | `cs-queue` |
 
 ## Verified in this repository
-* `cargo test --workspace`: 44 tests including integration tests against a real FFmpeg (all built-in presets are encoded and
+* `cargo test --workspace`: unit tests plus integration tests including integration tests against a real FFmpeg (all built-in presets are encoded and
   re-probed; cancel, progress, corrupt input, trimming and a real screen recording).
 * `cargo audit` (RustSec database, 1527 advisories, 478 crates): **0 vulnerabilities**. 6 informational warnings
   (unmaintained/unsound crates) remain in transitive Tauri dependencies: `glib`, `zbus_names`, `zvariant`,

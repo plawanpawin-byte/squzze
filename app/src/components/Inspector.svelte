@@ -34,6 +34,13 @@
     if (!s || d == null) return null;
     return (s.outPt ?? d) - (s.inPt ?? 0);
   });
+  const streams = $derived(info?.audio_streams ?? []);
+  const audio = $derived(app.current?.audio ?? null);
+  const chosen = $derived(streams[audio?.stream ?? 0] ?? null);
+  const layout = (c: number, l: string | null) => l ?? ({ 1: "mono", 2: "stereo", 6: "5.1", 8: "7.1" } as Record<number, string>)[c] ?? `${c} ch`;
+  const streamLabel = (a: (typeof streams)[number]) =>
+    `#${a.index + 1} · ${a.codec} · ${layout(a.channels, a.channel_layout)}${a.sample_rate ? ` · ${(a.sample_rate / 1000).toFixed(1)} kHz` : ""}${a.language ? ` · ${a.language}` : ""}${a.title ? ` · ${a.title}` : ""}`;
+  const downmixes = $derived([1, 2].filter((c) => chosen && c < chosen.channels));
   const container = (f: string) => {
     const k = f.split(",")[0];
     return ({ mov: "QuickTime movie", matroska: "Matroska", webm: "WebM", wav: "WAVE audio", flac: "FLAC audio", mp3: "MP3 audio", ogg: "Ogg", avi: "AVI" } as Record<string, string>)[k] ?? k.toUpperCase();
@@ -42,7 +49,7 @@
     if (!info) return [] as string[];
     const l: string[] = [container(info.format_name)];
     if (info.video) l.push(`Video: ${info.video.codec.toUpperCase()}, ${info.video.width}×${info.video.height}${info.video.fps ? `, ${info.video.fps} fps` : ""}`);
-    if (info.audio) l.push(`Audio: ${info.audio.codec.toUpperCase()}, ${info.audio.channels} ch${info.audio.sample_rate ? `, ${(info.audio.sample_rate / 1000).toFixed(1)} kHz` : ""}`);
+    if (info.audio) l.push(`Audio: ${info.audio.codec.toUpperCase()}, ${info.audio.channels} ch${info.audio.sample_rate ? `, ${(info.audio.sample_rate / 1000).toFixed(1)} kHz` : ""}${info.audio_streams.length > 1 ? ` (+${info.audio_streams.length - 1} more)` : ""}`);
     l.push(`Duration: ${fmtDuration(info.duration_secs)} · ${fmtBytes(info.size_bytes)}`);
     return l;
   });
@@ -50,8 +57,27 @@
     const s: { title: string; rows: Row[] }[] = [];
     if (!info) return s;
     s.push({ title: "File Properties", rows: [["Container", container(info.format_name)], ["Size", fmtBytes(info.size_bytes)], ["Bit rate", info.bit_rate ? `${Math.round(info.bit_rate / 1000)} kbit/s` : "—"]] });
-    if (info.video) s.push({ title: "Video Properties", rows: [["Codec", info.video.codec], ["Frame size", `${info.video.width}×${info.video.height}`], ["Frame rate", info.video.fps ? `${info.video.fps} fps` : "—"], ["Field order", info.video.field_order ?? "—"], ["Pixel format", info.video.pix_fmt ?? "—"]] });
-    if (info.audio) s.push({ title: "Audio Properties", rows: [["Codec", info.audio.codec], ["Channels", String(info.audio.channels)], ["Sample rate", info.audio.sample_rate ? `${info.audio.sample_rate} Hz` : "—"]] });
+    if (info.video) {
+      const v = info.video;
+      const unk = "Unknown";
+      const color = [v.color_primaries, v.color_transfer, v.color_space].filter(Boolean).join(" / ");
+      s.push({
+        title: "Video Properties",
+        rows: [
+          ["Codec", v.codec],
+          ["Profile / level", [v.profile, v.level && `L${v.level}`].filter(Boolean).join(" · ") || unk],
+          ["Frame size", `${v.width}×${v.height}`],
+          ["Frame rate", v.fps ? `${v.fps} fps · ${v.vfr ? "variable" : "constant"}` : unk],
+          ["Bit depth", v.bit_depth ? `${v.bit_depth}-bit` : unk],
+          ["Pixel format", v.pix_fmt ?? unk],
+          ["Field order", v.field_order ?? unk],
+          ["Colour", color || unk],
+          ["Range", v.color_range ?? unk],
+          ["Timecode", v.timecode ?? "None"],
+        ],
+      });
+    }
+    if (info.subtitles.length) s.push({ title: "Subtitles", rows: info.subtitles.map((t, i): Row => [`#${i + 1}`, [t.codec, t.language, t.title].filter(Boolean).join(" · ")]) });
     if (out) {
       const r: Row[] = [["Preset", out.name], ["Container", `.${out.container}`]];
       if (out.video) r.push(["Video", `${out.video.codec}${out.video.rate.mode === "crf" && out.video.rate.value ? ` · quality ${out.video.rate.value}` : out.video.rate.mode === "bitrate" ? ` · ${out.video.rate.value} kbit/s` : ""}`], ["Max height", out.video.max_height ? `${out.video.max_height} px` : "keep"]);
@@ -108,6 +134,50 @@
           <p class="tip">Move the playhead and press <kbd>I</kbd> / <kbd>O</kbd>, or type a time. Only this range is exported.</p>
         {/if}
       </section>
+      {#if info.video?.hdr}
+        <div class="note warn" role="note">HDR source ({info.video.color_transfer}). Squeeze does not tone-map yet, so SDR outputs will look flat and washed out.</div>
+      {/if}
+      {#if info.video?.vfr}
+        <div class="note" role="note">Variable frame rate. Outputs keep the timing but some players handle it poorly.</div>
+      {/if}
+      {#if streams.length && audio}
+        <section>
+          <h3><button class="sh" aria-expanded={!closed.Audio} onclick={() => (closed.Audio = !closed.Audio)}>Audio ({streams.length} stream{streams.length === 1 ? "" : "s"})<span aria-hidden="true">{closed.Audio ? "▸" : "▾"}</span></button></h3>
+          {#if !closed.Audio}
+            <ul class="streams" role="radiogroup" aria-label="Audio stream to use">
+              {#each streams as a}
+                <li>
+                  <label class:on={(audio.stream ?? 0) === a.index}>
+                    <input type="radio" name="astream" disabled={streams.length === 1 || audio.mode === "none"} checked={(audio.stream ?? 0) === a.index}
+                      onchange={() => { audio.stream = a.index; if (audio.channels && audio.channels >= a.channels) audio.channels = null; }} />
+                    <span>{streamLabel(a)}</span>
+                  </label>
+                </li>
+              {/each}
+            </ul>
+            <dl>
+              <dt>Audio</dt>
+              <dd>
+                <select class="val sel" aria-label="What to do with the audio" bind:value={audio.mode} onchange={() => { if (audio.mode !== "encode") audio.channels = null; }}>
+                  <option value="encode">Convert with the preset</option>
+                  <option value="copy">Copy the original</option>
+                  <option value="none">Remove audio</option>
+                </select>
+              </dd>
+              {#if audio.mode === "encode"}
+                <dt>Channels</dt>
+                <dd>
+                  <select class="val sel" aria-label="Audio channels" value={audio.channels ?? 0} onchange={(e) => (audio.channels = Number(e.currentTarget.value) || null)}>
+                    <option value={0}>Keep ({chosen ? layout(chosen.channels, chosen.channel_layout) : "source"})</option>
+                    {#each downmixes as c}<option value={c}>{c === 1 ? "Mono" : "Stereo"} (downmix)</option>{/each}
+                  </select>
+                </dd>
+              {/if}
+            </dl>
+            {#if app.audioProblem && app.audioProblem.startsWith(app.current?.name ?? "")}<p class="tip bad">{app.audioProblem}</p>{:else if audio.mode === "copy"}<p class="tip">The audio is copied as it is: no quality loss and no re-encoding.</p>{/if}
+          {/if}
+        </section>
+      {/if}
       {#each sections as s}
         <section>
           <h3><button class="sh" aria-expanded={!closed[s.title]} onclick={() => (closed[s.title] = !closed[s.title])}>{s.title}<span aria-hidden="true">{closed[s.title] ? "▸" : "▾"}</span></button></h3>
@@ -143,6 +213,14 @@
   dd { margin: 0; min-width: 0; }
   .val { display: block; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .none { color: var(--faint); padding: 12px; }
+  .note { margin: 8px 12px 0; padding: 6px 9px; border-radius: 6px; background: var(--panel-2); color: var(--muted); font-size: 11px; line-height: 1.45; }
+  .note.warn { background: #f5a62318; color: var(--warn); }
+  .streams { list-style: none; margin: 0 0 6px; padding: 0 12px; display: grid; gap: 3px; }
+  .streams label { display: flex; gap: 7px; align-items: flex-start; padding: 3px 6px; border-radius: 5px; color: var(--muted); }
+  .streams label.on { background: var(--sel); color: var(--text); }
+  .streams input { margin-top: 2px; }
+  .sel { width: 100%; font: inherit; color: var(--text); }
+  .tip.bad { color: var(--danger); }
   .inp { width: 100%; font: inherit; color: var(--text); }
   .inp::placeholder { color: var(--faint); }
   .tip { margin: 6px 12px 0; color: var(--faint); font-size: 11px; line-height: 1.4; }

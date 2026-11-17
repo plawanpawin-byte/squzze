@@ -1,10 +1,14 @@
 <script lang="ts">
   import { app } from "$lib/app.svelte";
-  import { stem, fmtDuration } from "$lib/format";
+  import { stem, fmtDuration, fmtBytes } from "$lib/format";
 
   function fileFor(name: string, presetId: string): string {
     const p = app.preset(presetId);
     return p ? `${stem(name)}-${presetId}.${p.container}` : "";
+  }
+  function estimateOf(s: (typeof app.sources)[number], presetId: string): number | null {
+    const pr = app.preset(presetId);
+    return pr && s.info ? app.estimate(pr, s.info, s.inPt, s.outPt, s.audio) : null;
   }
   const where = $derived(app.dest ? app.dest.split(/[\\/]/).pop() || app.dest : "Source");
   const names = $derived(app.sources.map((s) => s.name).join(", "));
@@ -52,7 +56,7 @@
         </div>
         {#if s.info}
           <table>
-            <thead><tr><th class="c1">Preset</th><th class="c2">Location</th><th>Filename</th><th class="c4"></th></tr></thead>
+            <thead><tr><th class="c1">Preset</th><th class="c2">Location</th><th>Filename</th><th class="c5" title="Only shown when it can be calculated from a target bitrate">Est. size</th><th class="c4"></th></tr></thead>
             <tbody>
               {#each s.outputs as o (o.uid)}
                 <tr class:rsel={app.selectedOutput === o.uid} onclick={() => { app.selected = s.path; app.selectedOutput = o.uid; }}>
@@ -66,10 +70,11 @@
                   </div></td>
                   <td class="c2"><span class="ico folder" aria-hidden="true"></span><span class="ell" title={app.dest ?? "Same folder as the source"}>{where}</span></td>
                   <td class="ell" title={fileFor(s.name, o.presetId)}>{fileFor(s.name, o.presetId)}</td>
+                  <td class="c5" title={estimateOf(s, o.presetId) == null ? "Quality-based encoding: the size depends on the content, so Squeeze does not guess" : "Estimated from the target bitrate"}>{estimateOf(s, o.presetId) == null ? "—" : "~" + fmtBytes(estimateOf(s, o.presetId)!)}</td>
                   <td class="c4"><button class="icon-btn" aria-label="Remove this output" title="Remove output" onclick={(e) => { e.stopPropagation(); app.removeOutput(s.path, o.uid); }}>✕</button></td>
                 </tr>
               {:else}
-                <tr><td colspan="4" class="hint">No outputs — click a preset in the sidebar or “Add”.</td></tr>
+                <tr><td colspan="5" class="hint">No outputs — click a preset in the sidebar or “Add”.</td></tr>
               {/each}
             </tbody>
           </table>
@@ -106,8 +111,9 @@
   tbody tr { cursor: default; }
   tbody tr:hover { background: var(--panel-3); }
   tr.rsel { background: var(--sel) !important; }
-  .c1 { width: 40%; }
-  .c2 { width: 22%; }
+  .c1 { width: 36%; }
+  .c2 { width: 16%; }
+  .c5 { width: 74px; text-align: right; color: var(--muted); white-space: nowrap; }
   .c4 { width: 34px; padding: 0; text-align: center; }
   .c1, .c2 { white-space: nowrap; }
   .cell { display: flex; align-items: center; gap: 6px; min-width: 0; }

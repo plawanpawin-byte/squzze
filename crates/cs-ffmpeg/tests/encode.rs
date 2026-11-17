@@ -1,7 +1,7 @@
 //! Integration tests that run the real FFmpeg. Skipped (with a message) when FFmpeg is absent.
 
 use cs_ffmpeg::*;
-use cs_probe::{locate_tool, probe};
+use cs_probe::{locate_tool, probe, MediaInfo};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -215,5 +215,63 @@ fn trim_produces_exact_length_on_real_recording() {
     let d = oi.duration_secs.unwrap();
     assert!((d - 5.0).abs() < 0.3, "trimmed duration {d}");
     assert!(oi.video.unwrap().height <= 720);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn audio_choices_work_end_to_end() {
+    let Some((ffmpeg, ffprobe)) = tools() else { return };
+    let dir = workdir("audiochoice");
+    // video + two audio tracks: #0 mono 8 kHz, #1 stereo 44.1 kHz, both AAC in MKV
+    let src = dir.join("two_tracks.mkv");
+    let st = Command::new(&ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=1", "-f", "lavfi", "-i", "sine=frequency=300:duration=1:sample_rate=8000", "-f", "lavfi", "-i", "sine=frequency=900:duration=1:sample_rate=44100"])
+        .args(["-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ac:a:0", "1", "-ac:a:1", "2", "-shortest"])
+        .arg(&src)
+        .stdin(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let info = probe(&ffprobe, &src).unwrap();
+    assert_eq!(info.audio_streams.len(), 2);
+    let preset = builtin_presets().into_iter().find(|p| p.id == "h264-720").unwrap();
+    let run = |name: &str, choice: AudioChoice| -> MediaInfo {
+        cs_ffmpeg::audio::validate(&preset, &info, &choice).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let out = dir.join(format!("{name}.mp4"));
+        let args = build_args_full(&preset, &src, &out, None, Trim::default(), &choice);
+        run_encode(&ffmpeg, &args, Some(1.0), &AtomicBool::new(false), |_| {}).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let oi = probe(&ffprobe, &out).unwrap();
+        let expect_audio = choice.mode != AudioMode::None;
+        let copied = (choice.mode == AudioMode::Copy).then(|| info.audio_streams[choice.stream_index() as usize].codec.clone());
+        let v = verify_output_with(&oi, &preset, Some(1.0), expect_audio, copied.as_deref());
+        assert!(v.ok, "{name}: {:?}", v.notes);
+        oi
+    };
+    // which track was used shows in the channel count (mono vs stereo)
+    assert_eq!(run("first", AudioChoice::default()).audio.unwrap().channels, 1);
+    assert_eq!(run("second", AudioChoice { stream: Some(1), ..Default::default() }).audio.unwrap().channels, 2);
+    // copy keeps the original codec and sample rate untouched
+    let copied = run("copy", AudioChoice { stream: Some(1), mode: AudioMode::Copy, channels: None }).audio.unwrap();
+    assert_eq!((copied.codec.as_str(), copied.sample_rate), ("aac", Some(44100)));
+    // remove: no audio stream at all
+    assert!(run("none", AudioChoice { mode: AudioMode::None, ..Default::default() }).audio.is_none());
+    // downmix needs a multichannel source
+    let surround = dir.join("surround.mkv");
+    let st = Command::new(&ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=1", "-f", "lavfi", "-i", "sine=frequency=300:duration=1", "-af", "pan=5.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+        .arg(&surround)
+        .stdin(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let sinfo = probe(&ffprobe, &surround).unwrap();
+    assert_eq!(sinfo.audio.as_ref().unwrap().channels, 6);
+    let choice = AudioChoice { channels: Some(2), ..Default::default() };
+    cs_ffmpeg::audio::validate(&preset, &sinfo, &choice).unwrap();
+    let out = dir.join("down.mp4");
+    run_encode(&ffmpeg, &build_args_full(&preset, &surround, &out, None, Trim::default(), &choice), Some(1.0), &AtomicBool::new(false), |_| {}).unwrap();
+    assert_eq!(probe(&ffprobe, &out).unwrap().audio.unwrap().channels, 2);
+    // an upmix request is refused before any work starts
+    assert!(cs_ffmpeg::audio::validate(&preset, &info, &AudioChoice { stream: Some(0), channels: Some(2), ..Default::default() }).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }

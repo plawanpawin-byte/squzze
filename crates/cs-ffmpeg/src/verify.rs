@@ -17,6 +17,26 @@ pub struct Verify {
     pub audio_codec: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// SHA-256 of the finished file (lets the user re-check it later).
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// SHA-256 of a file as lowercase hex, read in chunks (works for very large files).
+pub fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn expected_codec(c: VideoCodec) -> &'static str {
@@ -32,6 +52,12 @@ fn expected_codec(c: VideoCodec) -> &'static str {
 
 /// `expected_secs`: length the output should have (trimmed source length).
 pub fn verify_output(out: &MediaInfo, preset: &Preset, expected_secs: Option<f64>, source_has_audio: bool) -> Verify {
+    verify_output_with(out, preset, expected_secs, source_has_audio, None)
+}
+
+/// `expected_audio_codec`: set when the audio was copied, so the output must carry that exact codec.
+pub fn verify_output_with(out: &MediaInfo, preset: &Preset, expected_secs: Option<f64>, expect_audio: bool, expected_audio_codec: Option<&str>) -> Verify {
+    let source_has_audio = expect_audio;
     let mut notes = vec![];
     if out.size_bytes.unwrap_or(0) == 0 {
         notes.push("output file is empty".to_string());
@@ -55,6 +81,14 @@ pub fn verify_output(out: &MediaInfo, preset: &Preset, expected_secs: Option<f64
     if preset.audio.is_some() && source_has_audio && out.audio.is_none() {
         notes.push("source had audio but the output has none".into());
     }
+    if let (Some(want), Some(a)) = (expected_audio_codec, &out.audio) {
+        if a.codec != want {
+            notes.push(format!("audio codec is {} but the original {want} should have been copied", a.codec));
+        }
+    }
+    if !expect_audio && out.audio.is_some() {
+        notes.push("output has audio although none was expected".into());
+    }
     if let (Some(exp), Some(got)) = (expected_secs, out.duration_secs) {
         let tol = (exp * 0.03).max(0.6);
         if (got - exp).abs() > tol {
@@ -72,6 +106,7 @@ pub fn verify_output(out: &MediaInfo, preset: &Preset, expected_secs: Option<f64
         audio_codec: out.audio.as_ref().map(|a| a.codec.clone()),
         width: out.video.as_ref().map(|v| v.width),
         height: out.video.as_ref().map(|v| v.height),
+        sha256: None,
     }
 }
 
@@ -89,12 +124,28 @@ mod tests {
             duration_secs: dur,
             size_bytes: Some(size),
             bit_rate: None,
-            video: vcodec.map(|c| VideoInfo { codec: c.into(), width: h * 16 / 9, height: h, fps: Some(30.0), pix_fmt: None, field_order: None }),
-            audio: acodec.map(|c| AudioInfo { codec: c.into(), channels: 2, sample_rate: Some(48000) }),
+            video: vcodec.map(|c| VideoInfo { codec: c.into(), width: h * 16 / 9, height: h, fps: Some(30.0), ..Default::default() }),
+            audio: acodec.map(|c| AudioInfo { codec: c.into(), channels: 2, sample_rate: Some(48000), ..Default::default() }),
+            audio_streams: vec![],
+            subtitles: vec![],
         }
     }
     fn preset(id: &str) -> Preset {
         builtin_presets().into_iter().find(|p| p.id == id).unwrap()
+    }
+
+    #[test]
+    fn sha256_matches_known_vectors() {
+        let dir = std::env::temp_dir().join(format!("sq-sha-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("abc.txt");
+        std::fs::write(&f, b"abc").unwrap();
+        assert_eq!(sha256_file(&f).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        let e = dir.join("empty.bin");
+        std::fs::write(&e, b"").unwrap();
+        assert_eq!(sha256_file(&e).unwrap(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert!(sha256_file(&dir.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

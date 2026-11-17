@@ -27,7 +27,7 @@ pub enum ProbeError {
     Parse(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct VideoInfo {
     pub codec: String,
     pub width: u32,
@@ -35,13 +35,54 @@ pub struct VideoInfo {
     pub fps: Option<f64>,
     pub pix_fmt: Option<String>,
     pub field_order: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub level: Option<String>,
+    /// 8, 10, 12 … when it can be determined.
+    #[serde(default)]
+    pub bit_depth: Option<u32>,
+    #[serde(default)]
+    pub color_primaries: Option<String>,
+    #[serde(default)]
+    pub color_transfer: Option<String>,
+    #[serde(default)]
+    pub color_space: Option<String>,
+    #[serde(default)]
+    pub color_range: Option<String>,
+    /// Frame rate is not constant (average and nominal rates differ by more than 2 %).
+    #[serde(default)]
+    pub vfr: bool,
+    /// PQ (HDR10 / Dolby Vision base) or HLG transfer.
+    #[serde(default)]
+    pub hdr: bool,
+    #[serde(default)]
+    pub timecode: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct AudioInfo {
     pub codec: String,
     pub channels: u32,
     pub sample_rate: Option<u32>,
+    /// Position among the audio streams (0 = first).
+    #[serde(default)]
+    pub index: u32,
+    #[serde(default)]
+    pub channel_layout: Option<String>,
+    #[serde(default)]
+    pub bit_rate: Option<u64>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubtitleInfo {
+    pub codec: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -53,7 +94,12 @@ pub struct MediaInfo {
     pub size_bytes: Option<u64>,
     pub bit_rate: Option<u64>,
     pub video: Option<VideoInfo>,
+    /// The first audio stream (kept for convenience; see `audio_streams` for all of them).
     pub audio: Option<AudioInfo>,
+    #[serde(default)]
+    pub audio_streams: Vec<AudioInfo>,
+    #[serde(default)]
+    pub subtitles: Vec<SubtitleInfo>,
 }
 
 /// Resolve a tool such as `ffmpeg` from `extra_dirs`, then `PATH`. Never the current directory.
@@ -173,6 +219,16 @@ struct RawStream {
     channels: Option<u32>,
     sample_rate: Option<String>,
     disposition: Option<RawDisposition>,
+    profile: Option<String>,
+    level: Option<i64>,
+    bits_per_raw_sample: Option<String>,
+    color_primaries: Option<String>,
+    color_transfer: Option<String>,
+    color_space: Option<String>,
+    color_range: Option<String>,
+    channel_layout: Option<String>,
+    bit_rate: Option<String>,
+    tags: Option<std::collections::HashMap<String, String>>,
 }
 #[derive(Deserialize)]
 struct RawDisposition {
@@ -192,6 +248,10 @@ fn parse_rate(s: &str) -> Option<f64> {
 pub fn parse_probe_json(json: &str, path: &Path) -> Result<MediaInfo, ProbeError> {
     let raw: RawProbe = serde_json::from_str(json).map_err(|e| ProbeError::Parse(e.to_string()))?;
     let fmt = raw.format.ok_or_else(|| ProbeError::Parse("no format section".into()))?;
+    let tag = |s: &RawStream, k: &str| -> Option<String> {
+        s.tags.as_ref().and_then(|t| t.iter().find(|(key, _)| key.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone())).filter(|v| !v.trim().is_empty())
+    };
+    let known = |v: &Option<String>| v.clone().filter(|x| x != "unknown" && x != "unspecified" && !x.is_empty());
     let video = raw
         .streams
         .iter()
@@ -199,27 +259,61 @@ pub fn parse_probe_json(json: &str, path: &Path) -> Result<MediaInfo, ProbeError
             s.codec_type.as_deref() == Some("video")
                 && s.disposition.as_ref().and_then(|d| d.attached_pic) != Some(1)
         })
-        .map(|s| VideoInfo {
-            codec: s.codec_name.clone().unwrap_or_default(),
-            width: s.width.unwrap_or(0),
-            height: s.height.unwrap_or(0),
-            fps: s
-                .avg_frame_rate
+        .map(|s| {
+            let avg = s.avg_frame_rate.as_deref().and_then(parse_rate);
+            let nominal = s.r_frame_rate.as_deref().and_then(parse_rate);
+            let vfr = match (avg, nominal) {
+                (Some(a), Some(n)) => ((a - n).abs() / n.max(0.001)) > 0.02,
+                _ => false,
+            };
+            let transfer = known(&s.color_transfer);
+            let bit_depth = s
+                .bits_per_raw_sample
                 .as_deref()
-                .and_then(parse_rate)
-                .or_else(|| s.r_frame_rate.as_deref().and_then(parse_rate)),
-            pix_fmt: s.pix_fmt.clone(),
-            field_order: s.field_order.clone(),
+                .and_then(|b| b.parse::<u32>().ok())
+                .or_else(|| s.pix_fmt.as_deref().and_then(depth_from_pix_fmt));
+            VideoInfo {
+                codec: s.codec_name.clone().unwrap_or_default(),
+                width: s.width.unwrap_or(0),
+                height: s.height.unwrap_or(0),
+                fps: avg.or(nominal),
+                pix_fmt: s.pix_fmt.clone(),
+                field_order: s.field_order.clone(),
+                profile: s.profile.clone().filter(|p| p != "unknown"),
+                level: s.level.and_then(|l| level_text(s.codec_name.as_deref().unwrap_or(""), l)),
+                bit_depth,
+                color_primaries: known(&s.color_primaries),
+                color_space: known(&s.color_space),
+                color_range: known(&s.color_range),
+                hdr: matches!(transfer.as_deref(), Some("smpte2084") | Some("arib-std-b67")),
+                color_transfer: transfer,
+                vfr,
+                timecode: tag(s, "timecode"),
+            }
         });
-    let audio = raw
+    let audio_streams: Vec<AudioInfo> = raw
         .streams
         .iter()
-        .find(|s| s.codec_type.as_deref() == Some("audio"))
-        .map(|s| AudioInfo {
+        .filter(|s| s.codec_type.as_deref() == Some("audio"))
+        .enumerate()
+        .map(|(i, s)| AudioInfo {
             codec: s.codec_name.clone().unwrap_or_default(),
             channels: s.channels.unwrap_or(0),
             sample_rate: s.sample_rate.as_deref().and_then(|v| v.parse().ok()),
-        });
+            index: i as u32,
+            channel_layout: s.channel_layout.clone().filter(|l| !l.is_empty()),
+            bit_rate: s.bit_rate.as_deref().and_then(|v| v.parse().ok()),
+            language: tag(s, "language").filter(|l| l != "und"),
+            title: tag(s, "title"),
+        })
+        .collect();
+    let audio = audio_streams.first().cloned();
+    let subtitles: Vec<SubtitleInfo> = raw
+        .streams
+        .iter()
+        .filter(|s| s.codec_type.as_deref() == Some("subtitle"))
+        .map(|s| SubtitleInfo { codec: s.codec_name.clone().unwrap_or_default(), language: tag(s, "language").filter(|l| l != "und"), title: tag(s, "title") })
+        .collect();
     if video.is_none() && audio.is_none() {
         return Err(ProbeError::Parse("no audio or video streams".into()));
     }
@@ -232,7 +326,36 @@ pub fn parse_probe_json(json: &str, path: &Path) -> Result<MediaInfo, ProbeError
         bit_rate: fmt.bit_rate.as_deref().and_then(|v| v.parse().ok()),
         video,
         audio,
+        audio_streams,
+        subtitles,
     })
+}
+
+/// FFmpeg reports levels as integers: H.264 uses level*10 (31 -> 3.1), HEVC uses level*30 (153 -> 5.1).
+/// Other codecs are left unknown rather than guessed.
+fn level_text(codec: &str, l: i64) -> Option<String> {
+    if l <= 0 {
+        return None;
+    }
+    match codec {
+        "h264" => Some(format!("{:.1}", l as f64 / 10.0)),
+        "hevc" => Some(format!("{:.1}", l as f64 / 30.0)),
+        _ => None,
+    }
+}
+
+/// "yuv420p10le" -> 10, "yuv420p" -> 8, "rgb24" -> 8 … (None when unknown).
+fn depth_from_pix_fmt(f: &str) -> Option<u32> {
+    for d in [16u32, 14, 12, 10, 9] {
+        if f.contains(&format!("p{d}")) || f.contains(&format!("{d}le")) || f.contains(&format!("{d}be")) {
+            return Some(d);
+        }
+    }
+    if f.starts_with("yuv") || f.starts_with("nv") || f.starts_with("rgb") || f.starts_with("bgr") || f.starts_with("gray") {
+        Some(8)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +376,40 @@ mod tests {
         assert_eq!(v.fps, Some(29.97));
         assert_eq!(m.audio.unwrap().sample_rate, Some(48000));
         assert_eq!(m.duration_secs, Some(30.0));
+    }
+
+    #[test]
+    fn reads_hdr_bit_depth_vfr_timecode_streams_and_subtitles() {
+        let j = r#"{"streams":[
+          {"codec_type":"video","codec_name":"hevc","profile":"Main 10","level":153,"width":3840,"height":2160,"r_frame_rate":"60/1","avg_frame_rate":"3000/101","pix_fmt":"yuv420p10le","color_primaries":"bt2020","color_transfer":"smpte2084","color_space":"bt2020nc","color_range":"tv","tags":{"timecode":"01:00:00:00"}},
+          {"codec_type":"audio","codec_name":"aac","channels":2,"channel_layout":"stereo","sample_rate":"48000","bit_rate":"128000","tags":{"language":"eng","title":"Main"}},
+          {"codec_type":"audio","codec_name":"ac3","channels":6,"channel_layout":"5.1(side)","sample_rate":"48000","tags":{"language":"tha"}},
+          {"codec_type":"subtitle","codec_name":"mov_text","tags":{"language":"tha"}}],
+          "format":{"format_name":"mov,mp4","duration":"10.0","size":"1000"}}"#;
+        let m = parse_probe_json(j, Path::new("x.mp4")).unwrap();
+        let v = m.video.unwrap();
+        assert_eq!(v.profile.as_deref(), Some("Main 10"));
+        assert_eq!(v.level.as_deref(), Some("5.1"));
+        assert_eq!(v.bit_depth, Some(10));
+        assert!(v.hdr && v.vfr);
+        assert_eq!(v.color_transfer.as_deref(), Some("smpte2084"));
+        assert_eq!(v.timecode.as_deref(), Some("01:00:00:00"));
+        assert_eq!(m.audio_streams.len(), 2);
+        assert_eq!(m.audio_streams[1].index, 1);
+        assert_eq!(m.audio_streams[1].channels, 6);
+        assert_eq!(m.audio_streams[0].language.as_deref(), Some("eng"));
+        assert_eq!(m.subtitles.len(), 1);
+        assert_eq!(m.audio.unwrap().codec, "aac");
+    }
+
+    #[test]
+    fn missing_details_stay_unknown_not_guessed() {
+        let m = parse_probe_json(SAMPLE, Path::new("a.mp4")).unwrap();
+        let v = m.video.unwrap();
+        assert_eq!(v.color_primaries, None);
+        assert_eq!(v.timecode, None);
+        assert!(!v.hdr && !v.vfr);
+        assert_eq!(v.bit_depth, Some(8));
     }
 
     #[test]

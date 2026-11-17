@@ -33,6 +33,15 @@ pub enum RateControl {
     Bitrate(u32),
 }
 
+/// Encoder effort: faster = bigger files, slower = smaller files at the same quality.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Speed {
+    Fast,
+    Medium,
+    Slow,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VideoSpec {
     pub codec: VideoCodec,
@@ -40,7 +49,33 @@ pub struct VideoSpec {
     /// Scale down so the height is at most this value (never upscales).
     pub max_height: Option<u32>,
     pub fps: Option<f64>,
+    /// 8 (default) or 10. 10-bit needs a software encoder and a capable player.
+    #[serde(default)]
+    pub bit_depth: Option<u32>,
+    /// Force a keyframe every N seconds (streaming / seeking). Software encoders only: hardware encoders ignore it.
+    #[serde(default)]
+    pub keyint_secs: Option<f64>,
+    #[serde(default)]
+    pub speed: Option<Speed>,
+    /// Two passes give a more accurate bitrate. Bitrate mode with H.264, HEVC or VP9 only.
+    #[serde(default)]
+    pub two_pass: bool,
+    /// H.264 only: baseline, main or high.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// H.264 only, e.g. "4.1".
+    #[serde(default)]
+    pub level: Option<String>,
 }
+
+impl VideoSpec {
+    /// True when the user asked for something only the software encoder can do exactly.
+    pub fn needs_software(&self) -> bool {
+        self.bit_depth == Some(10) || self.two_pass || self.profile.is_some() || self.level.is_some() || self.speed.is_some() || self.keyint_secs.is_some()
+    }
+}
+
+pub const H264_LEVELS: [&str; 12] = ["3.0", "3.1", "3.2", "4.0", "4.1", "4.2", "5.0", "5.1", "5.2", "6.0", "6.1", "6.2"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioSpec {
@@ -49,8 +84,20 @@ pub struct AudioSpec {
     pub channels: Option<u32>,
 }
 
+/// Current preset file format. v1 had no `schema` field; v2 adds `schema` and `description`.
+pub const PRESET_SCHEMA: u32 = 2;
+
+fn default_schema() -> u32 {
+    PRESET_SCHEMA
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Preset {
+    /// Format version of this preset (see [`PRESET_SCHEMA`]).
+    #[serde(default = "default_schema")]
+    pub schema: u32,
+    #[serde(default)]
+    pub description: Option<String>,
     pub id: String,
     pub name: String,
     pub group: String,
@@ -179,6 +226,50 @@ impl Preset {
                     return err("fps must be 1-240");
                 }
             }
+            let lossy = matches!(v.codec, VideoCodec::H264 | VideoCodec::Hevc | VideoCodec::Av1 | VideoCodec::Vp9);
+            if let Some(b) = v.bit_depth {
+                if b != 8 && b != 10 {
+                    return err("bit depth must be 8 or 10");
+                }
+                if b == 10 && !lossy {
+                    return err(format!("{} has a fixed bit depth", v.codec.name()));
+                }
+            }
+            if let Some(k) = v.keyint_secs {
+                if !k.is_finite() || !(0.5..=20.0).contains(&k) {
+                    return err("keyframe interval must be 0.5-20 seconds");
+                }
+            }
+            if v.speed.is_some() && !lossy {
+                return err(format!("{} has no speed setting", v.codec.name()));
+            }
+            if v.two_pass {
+                if !matches!(v.rate, RateControl::Bitrate(_)) {
+                    return err("two-pass needs a target bitrate (not quality mode)");
+                }
+                if !matches!(v.codec, VideoCodec::H264 | VideoCodec::Hevc | VideoCodec::Vp9) {
+                    return err(format!("two-pass is not supported for {}", v.codec.name()));
+                }
+            }
+            if let Some(pr) = &v.profile {
+                if v.codec != VideoCodec::H264 {
+                    return err("a profile can only be set for H.264");
+                }
+                if !["baseline", "main", "high"].contains(&pr.as_str()) {
+                    return err("H.264 profile must be baseline, main or high");
+                }
+                if v.bit_depth == Some(10) {
+                    return err("an H.264 profile cannot be forced together with 10-bit");
+                }
+            }
+            if let Some(l) = &v.level {
+                if v.codec != VideoCodec::H264 {
+                    return err("a level can only be set for H.264");
+                }
+                if !H264_LEVELS.contains(&l.as_str()) {
+                    return err("H.264 level must be one of 3.0 … 6.2");
+                }
+            }
         }
         if let Some(a) = &self.audio {
             if !audio_ok(&self.container, a.codec) {
@@ -198,21 +289,42 @@ impl Preset {
         Ok(())
     }
 
+    /// Parse a preset file of any supported version, migrate it to the current one and validate it.
     pub fn from_json(s: &str) -> Result<Preset, PresetError> {
-        let p: Preset = serde_json::from_str(s).map_err(|e| PresetError(e.to_string()))?;
+        let v: serde_json::Value = serde_json::from_str(s).map_err(|e| PresetError(e.to_string()))?;
+        Preset::from_value(v)
+    }
+
+    pub fn from_value(v: serde_json::Value) -> Result<Preset, PresetError> {
+        let version = match v.get("schema") {
+            None | Some(serde_json::Value::Null) => 1,
+            Some(n) => n.as_u64().ok_or_else(|| PresetError("preset 'schema' must be a number".into()))? as u32,
+        };
+        if version == 0 {
+            return err("preset 'schema' must be 1 or higher");
+        }
+        if version > PRESET_SCHEMA {
+            return err(format!("this preset was made by a newer Squeeze (format {version}); update Squeeze to use it"));
+        }
+        let mut p: Preset = serde_json::from_value(v).map_err(|e| PresetError(e.to_string()))?;
+        // v1 -> v2 only added optional fields, so migrating means stamping the current version
+        p.schema = PRESET_SCHEMA;
+        if p.description.as_ref().is_some_and(|d| d.chars().count() > 300) {
+            return err("preset description is too long (max 300 characters)");
+        }
         p.validate()?;
         Ok(p)
     }
 }
 
 fn v(codec: VideoCodec, rate: RateControl, h: Option<u32>) -> Option<VideoSpec> {
-    Some(VideoSpec { codec, rate, max_height: h, fps: None })
+    Some(VideoSpec { codec, rate, max_height: h, fps: None, bit_depth: None, keyint_secs: None, speed: None, two_pass: false, profile: None, level: None })
 }
 fn a(codec: AudioCodec, kbps: Option<u32>) -> Option<AudioSpec> {
     Some(AudioSpec { codec, bitrate_kbps: kbps, channels: None })
 }
 fn p(id: &str, name: &str, group: &str, container: &str, video: Option<VideoSpec>, audio: Option<AudioSpec>) -> Preset {
-    Preset { id: id.into(), name: name.into(), group: group.into(), container: container.into(), video, audio }
+    Preset { schema: PRESET_SCHEMA, description: None, id: id.into(), name: name.into(), group: group.into(), container: container.into(), video, audio }
 }
 
 pub fn builtin_presets() -> Vec<Preset> {
@@ -277,6 +389,71 @@ mod tests {
         let mut p = builtin_presets().remove(0);
         p.video.as_mut().unwrap().fps = Some(f64::NAN);
         assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn v1_preset_without_schema_is_migrated() {
+        let v1 = r#"{"id":"old-one","name":"Old one","group":"Custom","container":"mp4",
+          "video":{"codec":"h264","rate":{"mode":"crf","value":23},"max_height":720,"fps":null},
+          "audio":{"codec":"aac","bitrate_kbps":128,"channels":null}}"#;
+        let p = Preset::from_json(v1).unwrap();
+        assert_eq!(p.schema, PRESET_SCHEMA);
+        assert_eq!(p.description, None);
+        assert_eq!(p.video.unwrap().max_height, Some(720));
+    }
+
+    #[test]
+    fn newer_or_invalid_schema_is_refused_with_a_reason() {
+        let future = r#"{"schema":99,"id":"x","name":"X","group":"Custom","container":"mp4","video":null,"audio":{"codec":"aac","bitrate_kbps":128,"channels":null}}"#;
+        let e = Preset::from_json(future).unwrap_err().to_string();
+        assert!(e.contains("newer Squeeze"), "{e}");
+        assert!(Preset::from_json(r#"{"schema":"two"}"#).is_err());
+        assert!(Preset::from_json(r#"{"schema":0,"id":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn all_builtins_use_the_current_schema_and_export_it() {
+        for p in builtin_presets() {
+            assert_eq!(p.schema, PRESET_SCHEMA);
+            assert!(serde_json::to_string(&p).unwrap().contains("\"schema\":2"));
+        }
+    }
+
+    fn adv(f: impl FnOnce(&mut VideoSpec)) -> Preset {
+        let mut p = builtin_presets().into_iter().find(|p| p.id == "h264-1080").unwrap();
+        f(p.video.as_mut().unwrap());
+        p
+    }
+
+    #[test]
+    fn advanced_settings_are_validated() {
+        assert!(adv(|v| v.bit_depth = Some(10)).validate().is_ok());
+        assert!(adv(|v| v.bit_depth = Some(12)).validate().is_err());
+        assert!(adv(|v| v.keyint_secs = Some(2.0)).validate().is_ok());
+        assert!(adv(|v| v.keyint_secs = Some(0.0)).validate().is_err());
+        assert!(adv(|v| v.keyint_secs = Some(f64::NAN)).validate().is_err());
+        assert!(adv(|v| v.speed = Some(Speed::Slow)).validate().is_ok());
+        assert!(adv(|v| v.two_pass = true).validate().is_err(), "two-pass needs bitrate mode");
+        assert!(adv(|v| { v.two_pass = true; v.rate = RateControl::Bitrate(3000); }).validate().is_ok());
+        assert!(adv(|v| { v.two_pass = true; v.rate = RateControl::Bitrate(3000); v.codec = VideoCodec::Av1; }).validate().is_err());
+        assert!(adv(|v| v.profile = Some("high".into())).validate().is_ok());
+        assert!(adv(|v| v.profile = Some("ultra".into())).validate().is_err());
+        assert!(adv(|v| { v.profile = Some("high".into()); v.bit_depth = Some(10); }).validate().is_err());
+        assert!(adv(|v| v.level = Some("4.1".into())).validate().is_ok());
+        assert!(adv(|v| v.level = Some("9.9".into())).validate().is_err());
+        let mut hevc = builtin_presets().into_iter().find(|p| p.id == "hevc-1080").unwrap();
+        hevc.video.as_mut().unwrap().profile = Some("main".into());
+        assert!(hevc.validate().is_err(), "profile is H.264 only");
+        let mut pr = builtin_presets().into_iter().find(|p| p.id == "prores422").unwrap();
+        pr.video.as_mut().unwrap().bit_depth = Some(10);
+        assert!(pr.validate().is_err());
+    }
+
+    #[test]
+    fn old_presets_without_advanced_fields_still_load() {
+        let p = Preset::from_json(r#"{"id":"o","name":"O","group":"Custom","container":"mp4","video":{"codec":"h264","rate":{"mode":"crf","value":22},"max_height":null,"fps":null},"audio":{"codec":"aac","bitrate_kbps":128,"channels":null}}"#).unwrap();
+        let v = p.video.unwrap();
+        assert!(!v.needs_software() && v.bit_depth.is_none() && !v.two_pass);
     }
 
     #[test]
