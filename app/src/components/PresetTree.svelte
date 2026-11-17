@@ -48,8 +48,8 @@
               <ul>
                 {#each g.items as it (it.id)}
                   <li class="row" class:picked={picked === it.id}>
-                    <button class="leaf" title="Click to add this output to the selected file" onclick={() => add(it.id)}>
-                      <span class="ico {it.video ? 'film' : 'wave'}" aria-hidden="true"></span>{it.name}
+                    <button class="leaf" class:off={!!app.unavailable[it.id]} title={app.unavailable[it.id] ?? "Click to add this output to the selected file"} aria-disabled={!!app.unavailable[it.id]} onclick={() => add(it.id)}>
+                      <span class="ico {it.video ? 'film' : 'wave'}" aria-hidden="true"></span>{it.name}{#if app.unavailable[it.id]}<span class="na"> · not available</span>{/if}
                     </button>
                   </li>
                 {/each}
@@ -131,6 +131,8 @@
   .group { color: var(--text); }
   .leaf { color: var(--text); opacity: 0.9; }
   .leaf.act { color: var(--accent); }
+  .leaf.off { opacity: 0.45; }
+  .na { font-size: 10.5px; color: var(--warn); }
   .group:hover, .row:hover { background: var(--panel-3); }
   .row { display: flex; align-items: center; border-radius: 5px; }
   .row.picked { background: var(--sel); }

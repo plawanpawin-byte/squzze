@@ -1,10 +1,11 @@
 //! Squeeze desktop shell: thin, validated bridge between the UI and the Rust engines.
 
 use base64::Engine as _;
-use cs_ffmpeg::{builtin_presets, detect_hw, ffmpeg_version, preview_frame, HwKind, Preset, RunError};
+use cs_ffmpeg::{builtin_presets, detect_hw, ffmpeg_version, list_encoders, preview_frame, unavailable_reason, HwKind, Preset, RunError};
 use cs_probe::{locate_tool, probe, validate_input, MediaInfo};
 use cs_queue::{write_atomic, Encoder, Event, FfmpegEncoder, Job, NewJob, Queue, Report, Settings};
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,7 @@ struct AppState {
     settings: Arc<Mutex<Settings>>,
     hw: Arc<Mutex<Vec<HwKind>>>,
     hw_ready: Arc<AtomicBool>,
+    encoders: HashSet<String>,
     ffmpeg: Option<PathBuf>,
     ffprobe: Option<PathBuf>,
     dir: PathBuf,
@@ -65,6 +67,17 @@ fn all_presets(s: &AppState) -> Vec<Preset> {
     let mut v = builtin_presets();
     v.extend(s.custom.lock().unwrap().iter().cloned());
     v
+}
+
+/// id -> reason, for presets the installed FFmpeg cannot run (empty when everything works).
+fn availability(s: &AppState) -> HashMap<String, String> {
+    let hw = s.hw.lock().unwrap().clone();
+    all_presets(s).into_iter().filter_map(|p| unavailable_reason(&p, &s.encoders, &hw).map(|why| (p.id, why))).collect()
+}
+
+#[tauri::command]
+fn preset_availability(state: State<'_, AppState>) -> HashMap<String, String> {
+    availability(&state)
 }
 
 fn save_custom(s: &AppState) -> Result<(), String> {
@@ -220,6 +233,9 @@ async fn add_job(
         check_dest(d)?;
     }
     let preset = all_presets(&state).into_iter().find(|p| p.id == preset_id).ok_or("unknown preset")?;
+    if let Some(why) = availability(&state).remove(&preset.id) {
+        return Err(why);
+    }
     let ffprobe = state.ffprobe.clone();
     let src = source.clone();
     let duration = tauri::async_runtime::spawn_blocking(move || ffprobe.and_then(|t| probe(&t, Path::new(&src)).ok()).and_then(|i| i.duration_secs))
@@ -317,6 +333,15 @@ pub fn run() {
             }
             let ffmpeg = locate_tool("ffmpeg", &extra);
             let ffprobe = locate_tool("ffprobe", &extra);
+            #[allow(unused_mut)]
+            let mut encoders: HashSet<String> = ffmpeg.as_deref().map(list_encoders).unwrap_or_default();
+            // Test hook, debug builds only: pretend some encoders are missing (used by scripts/e2e-availability.mjs).
+            #[cfg(debug_assertions)]
+            if let Ok(v) = std::env::var("SQUEEZE_TEST_HIDE_ENCODERS") {
+                for n in v.split(',') {
+                    encoders.remove(n.trim());
+                }
+            }
             let hw: Arc<Mutex<Vec<HwKind>>> = Arc::new(Mutex::new(vec![]));
             let hw_ready = Arc::new(AtomicBool::new(false));
 
@@ -346,11 +371,11 @@ pub fn run() {
                 hw_ready.store(true, Ordering::SeqCst);
             }
 
-            app.manage(AppState { queue, settings, hw, hw_ready, ffmpeg, ffprobe, dir, custom: Mutex::new(custom) });
+            app.manage(AppState { queue, settings, hw, hw_ready, encoders, ffmpeg, ffprobe, dir, custom: Mutex::new(custom) });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            app_info, list_presets, save_custom_preset, delete_custom_preset, export_preset, import_preset, pick_files, pick_folder, probe_files, preview, add_job,
+            app_info, list_presets, preset_availability, save_custom_preset, delete_custom_preset, export_preset, import_preset, pick_files, pick_folder, probe_files, preview, add_job,
             queue_list, queue_start, queue_pause, job_cancel, queue_cancel_all, job_retry, job_remove, queue_clear_finished, get_settings, set_settings, reveal_output
         ])
         .build(tauri::generate_context!())

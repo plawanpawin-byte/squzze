@@ -10,6 +10,18 @@ fn tools() -> Option<(PathBuf, PathBuf)> {
     Some((locate_tool("ffmpeg", &[])?, locate_tool("ffprobe", &[])?))
 }
 
+/// Presets whose encoders exist in this machine's FFmpeg (CI images ship reduced builds).
+fn usable(ffmpeg: &Path, p: &Preset) -> bool {
+    let enc = list_encoders(ffmpeg);
+    match unavailable_reason(p, &enc, &[]) {
+        None => true,
+        Some(why) => {
+            eprintln!("SKIP preset {}: {why}", p.id);
+            false
+        }
+    }
+}
+
 fn workdir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("squeeze-it-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -51,6 +63,9 @@ fn every_builtin_preset_encodes_and_probes_correctly() {
     let dir = workdir("presets");
     let src = make_fixture(&ffmpeg, &dir, "src clip ทดสอบ.mp4", 2);
     for p in builtin_presets() {
+        if !usable(&ffmpeg, &p) {
+            continue;
+        }
         let out = encode(&ffmpeg, &p, &src, &dir, 2.0, None).unwrap_or_else(|e| panic!("{}: {e}", p.id));
         let info = probe(&ffprobe, &out).unwrap_or_else(|e| panic!("{} probe: {e}", p.id));
         let d = info.duration_secs.unwrap_or(0.0);
@@ -100,8 +115,15 @@ fn cancel_stops_process_quickly() {
     let Some((ffmpeg, _)) = tools() else { return };
     let dir = workdir("cancel");
     let src = make_fixture(&ffmpeg, &dir, "c.mp4", 60);
-    let p = builtin_presets().into_iter().find(|p| p.id == "av1-1080-webm").unwrap();
-    let out = dir.join("o.webm");
+    // a slow software encoder, so there is time to cancel; whichever exists on this machine
+    let Some(p) = ["av1-1080-webm", "vp9-1080-webm", "hevc-1080", "h264-1080"]
+        .iter()
+        .filter_map(|id| builtin_presets().into_iter().find(|p| p.id == *id))
+        .find(|p| usable(&ffmpeg, p))
+    else {
+        return;
+    };
+    let out = dir.join(format!("o.{}", p.container));
     let args = build_args(&p, &src, &out, None);
     let flag = std::sync::Arc::new(AtomicBool::new(false));
     let f2 = flag.clone();
@@ -168,6 +190,9 @@ fn real_screen_recording_converts_and_verifies() {
     let dir = workdir("real");
     for id in ["h264-1080", "hevc-1080", "social-720", "vp9-1080-webm", "aac-256", "flac"] {
         let p = builtin_presets().into_iter().find(|p| p.id == id).unwrap();
+        if !usable(&ffmpeg, &p) {
+            continue;
+        }
         let out = encode(&ffmpeg, &p, &src, &dir, dur, None).unwrap_or_else(|e| panic!("{id}: {e}"));
         let oi = probe(&ffprobe, &out).unwrap();
         let v = verify_output(&oi, &p, Some(dur), info.audio.is_some());

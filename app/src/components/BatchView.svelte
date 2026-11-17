@@ -60,7 +60,7 @@
                     <span class="ico {app.preset(o.presetId)?.video ? 'film' : 'wave'}" aria-hidden="true"></span>
                     <select aria-label="Preset for {s.name}" bind:value={o.presetId}>
                       {#each app.presets as p (p.id)}
-                        <option value={p.id} disabled={!!p.video && !s.info.video}>{p.name}</option>
+                        <option value={p.id} disabled={(!!p.video && !s.info.video) || !!app.unavailable[p.id]} title={app.unavailable[p.id]}>{p.name}{app.unavailable[p.id] ? " (not available)" : ""}</option>
                       {/each}
                     </select>
                   </div></td>

@@ -152,7 +152,8 @@ fn run_inner(
                     match k {
                         "out_time_us" | "out_time_ms" => {
                             if let Ok(us) = v.parse::<f64>() {
-                                out_time = (us / 1_000_000.0).max(0.0);
+                                // never go backwards: FFmpeg can briefly report an earlier time while flushing
+                                out_time = out_time.max((us / 1_000_000.0).max(0.0));
                             }
                         }
                         "fps" => cur.fps = v.parse().ok(),
@@ -160,7 +161,8 @@ fn run_inner(
                         "progress" => {
                             let end = v == "end";
                             if let Some(d) = duration.filter(|d| *d > 0.0) {
-                                cur.percent = if end { 100.0 } else { ((out_time / d) * 100.0).clamp(0.0, 99.9) as f32 };
+                                let p = if end { 100.0 } else { ((out_time / d) * 100.0).clamp(0.0, 99.9) as f32 };
+                                cur.percent = cur.percent.max(p);
                                 cur.eta_secs = cur.speed.filter(|s| *s > 0.0).map(|s| ((d - out_time) / s).max(0.0));
                             } else if end {
                                 cur.percent = 100.0;

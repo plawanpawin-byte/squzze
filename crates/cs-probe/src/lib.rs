@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn parses_video_and_audio() {
-        let m = parse_probe_json(SAMPLE, Path::new("C:\\v\\a.mp4")).unwrap();
+        let m = parse_probe_json(SAMPLE, Path::new("some/dir/a.mp4")).unwrap();
         assert_eq!(m.file_name, "a.mp4");
         let v = m.video.unwrap();
         assert_eq!((v.codec.as_str(), v.width, v.height), ("h264", 1920, 1080));

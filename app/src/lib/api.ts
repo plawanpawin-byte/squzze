@@ -8,6 +8,7 @@ export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in
 export const api = {
   appInfo: () => invoke<AppInfo>("app_info"),
   listPresets: () => invoke<Preset[]>("list_presets"),
+  presetAvailability: () => invoke<Record<string, string>>("preset_availability"),
   saveCustomPreset: (preset: Preset) => invoke<Preset[]>("save_custom_preset", { preset }),
   deleteCustomPreset: (id: string) => invoke<Preset[]>("delete_custom_preset", { id }),
   exportPreset: (id: string) => invoke<boolean>("export_preset", { id }),

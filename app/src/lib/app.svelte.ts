@@ -45,6 +45,8 @@ function loadLayout(): Layout {
 class App {
   info = $state<AppInfo | null>(null);
   presets = $state<Preset[]>([]);
+  /** preset id -> why the installed FFmpeg cannot run it */
+  unavailable = $state<Record<string, string>>({});
   settings = $state<Settings | null>(null);
   jobs = $state<Job[]>([]);
   sources = $state<Source[]>([]);
@@ -154,6 +156,7 @@ class App {
     this.presets = presets;
     this.settings = settings;
     this.jobs = jobs;
+    this.unavailable = await api.presetAvailability();
     setInterval(() => (this.now = Date.now()), 1000);
     await onQueue((e) => {
       if (e.kind === "updated") {
@@ -169,13 +172,18 @@ class App {
         this.say(failed ? `Queue finished — ${failed} job(s) failed` : o ? `Queue finished — ${o.total} job(s) done` : "Queue finished", failed ? "error" : "info");
       }
     });
-    await onHwReady(async () => (this.info = await api.appInfo()));
+    await onHwReady(async () => {
+      this.info = await api.appInfo();
+      this.unavailable = await api.presetAvailability();
+    });
     await onFileDrop((paths) => this.addPaths(paths), (over) => (this.dragging = over));
   }
 
   defaultPresetFor(info: MediaInfo | null): string {
     const wanted = info && !info.video ? "aac-256" : "h264-1080";
-    return this.presets.some((p) => p.id === wanted) ? wanted : (this.presets[0]?.id ?? "");
+    const ok = (id: string) => this.presets.some((p) => p.id === id) && !this.unavailable[id];
+    if (ok(wanted)) return wanted;
+    return this.presets.find((p) => !this.unavailable[p.id] && (info?.video ? true : !p.video))?.id ?? (this.presets[0]?.id ?? "");
   }
 
   async pickAndAdd() {
@@ -218,6 +226,7 @@ class App {
   addOutput(presetId: string) {
     const targets = this.applyAll ? this.sources.filter((s) => s.info) : this.current?.info ? [this.current] : [];
     if (!targets.length) return this.say("Add a file first, then pick a preset", "error");
+    if (this.unavailable[presetId]) return this.say(this.unavailable[presetId], "error");
     for (const s of targets) {
       const p = this.preset(presetId);
       if (p?.video && s.info && !s.info.video) continue; // video preset on an audio-only source

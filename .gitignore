@@ -3,3 +3,4 @@
 /dist
 *.tmp
 /fixtures/generated
+/demo
