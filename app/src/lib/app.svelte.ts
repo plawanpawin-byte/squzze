@@ -22,7 +22,28 @@ class App {
   busy = $state(false);
   message = $state("");
   messageKind = $state<"info" | "error">("info");
+  showLeft = $state(true);
+  showRight = $state(true);
+  presetFilter = $state("");
+  selectedOutput = $state<number | null>(null);
+  thumbs = $state<Record<string, string>>({});
   private timer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Small poster frame for the batch list, loaded once per source. */
+  async loadThumb(path: string, secs: number) {
+    if (path in this.thumbs) return;
+    this.thumbs[path] = "";
+    try {
+      this.thumbs[path] = await api.preview(path, secs);
+    } catch {
+      /* no thumbnail; the block shows a placeholder */
+    }
+  }
+
+  addDefaultOutput(path: string) {
+    const s = this.sources.find((x) => x.path === path);
+    if (s?.info) s.outputs.push({ uid: uid++, presetId: this.defaultPresetFor(s.info) });
+  }
 
   current = $derived(this.sources.find((s) => s.path === this.selected) ?? null);
   activeJobs = $derived(this.jobs.filter((j) => j.state === "running" || j.state === "queued"));

@@ -16,7 +16,8 @@
     { id: "active", label: "Active" },
     { id: "completed", label: "Completed" },
   ];
-  const count = $derived({ current: app.sources.length, active: app.activeJobs.length, completed: app.finishedJobs.length });
+  const count = $derived({ current: 0, active: app.activeJobs.length, completed: 0 });
+  const cols = $derived(`${app.showLeft ? "240px" : "0px"} minmax(0, 1fr) ${app.showRight ? "300px" : "0px"}`);
 
   onMount(() => {
     app.init().catch((e) => app.say(String(e), "error"));
@@ -32,20 +33,32 @@
 
 <svelte:window onkeydown={key} />
 
-<div class="app">
+<div class="app" style:grid-template-columns={cols}>
   <header class="top">
-    <div class="brand">Squeeze</div>
-    <div class="tabs" role="tablist" aria-label="Queue views">
+    <div class="left">
+      <button class="icon-btn" class:on={app.showLeft} aria-pressed={app.showLeft} aria-label="Show or hide the preset sidebar" title="Sidebar" onclick={() => (app.showLeft = !app.showLeft)}>
+        <svg width="18" height="14" viewBox="0 0 18 14" aria-hidden="true"><rect x="0.5" y="0.5" width="17" height="13" rx="2.5" fill="none" stroke="currentColor"/><rect x="2" y="2" width="5" height="10" rx="1" fill="currentColor"/></svg>
+      </button>
+      <span class="brand">Squeeze</span>
+    </div>
+    <div class="seg tabs" role="tablist" aria-label="Queue views">
       {#each tabs as t}
-        <button role="tab" aria-selected={app.tab === t.id} class:on={app.tab === t.id} onclick={() => (app.tab = t.id)}>
-          {t.label}{count[t.id] ? ` (${count[t.id]})` : ""}
+        <button role="tab" aria-selected={app.tab === t.id} onclick={() => (app.tab = t.id)}>
+          {t.label}{count[t.id] ? ` · ${count[t.id]}` : ""}
         </button>
       {/each}
     </div>
-    <button class="ghost" onclick={() => app.pickAndAdd()}>Add files…</button>
+    <div class="right">
+      <button class="btn" onclick={() => app.pickAndAdd()} title="Add files (Ctrl+O)">Add files…</button>
+      <button class="icon-btn" class:on={app.showRight} aria-pressed={app.showRight} aria-label="Show or hide the inspector" title="Inspector" onclick={() => (app.showRight = !app.showRight)}>
+        <svg width="18" height="14" viewBox="0 0 18 14" aria-hidden="true"><rect x="0.5" y="0.5" width="17" height="13" rx="2.5" fill="none" stroke="currentColor"/><rect x="11" y="2" width="5" height="10" rx="1" fill="currentColor"/></svg>
+      </button>
+    </div>
   </header>
 
-  <PresetTree onnew={() => (dialog = { initial: null })} onedit={(p) => (dialog = { initial: p })} />
+  <div class="pane-left" class:hidden={!app.showLeft}>
+    <PresetTree onnew={() => (dialog = { initial: null })} onedit={(p) => (dialog = { initial: p })} />
+  </div>
 
   <main class="center">
     {#if app.ffmpegMissing}
@@ -64,24 +77,32 @@
     {/if}
   </main>
 
-  <Inspector />
+  <div class="pane-right" class:hidden={!app.showRight}>
+    <Inspector />
+  </div>
 
   <footer class="bottom">
-    {#if app.settings}
-      <label>Run
-        <select value={app.settings.max_parallel} onchange={(e) => app.setSetting({ max_parallel: Number(e.currentTarget.value) })} aria-label="Jobs at the same time">
-          {#each [1, 2, 3, 4] as n}<option value={n}>{n} at a time</option>{/each}
-        </select>
+    <div class="b-left">
+      <button class="icon-btn plus" aria-label="Add files" title="Add files (Ctrl+O)" onclick={() => app.pickAndAdd()}>＋</button>
+      <span class="msg" class:error={app.messageKind === "error"} role="status" aria-live="polite">{app.message}</span>
+    </div>
+    <div class="b-right">
+      {#if app.settings}
+        <label class="hwl" title={app.info?.hw.length ? app.info.hw.join(", ") : "No working hardware encoder found"}>
+          <input type="checkbox" checked={app.settings.use_hw} onchange={(e) => app.setSetting({ use_hw: e.currentTarget.checked })} />
+          GPU {app.info?.hw_ready ? (app.info.hw.length ? app.info.hw.join(" · ") : "none") : "checking…"}
+        </label>
+        <label>Jobs
+          <select class="field" value={app.settings.max_parallel} onchange={(e) => app.setSetting({ max_parallel: Number(e.currentTarget.value) })} aria-label="Jobs at the same time">
+            {#each [1, 2, 3, 4] as n}<option value={n}>{n} at a time</option>{/each}
+          </select>
+        </label>
+      {/if}
+      <label>Process on
+        <select class="field" aria-label="Process on"><option>This Computer</option></select>
       </label>
-      <label class="hwl" title={app.info?.hw.length ? app.info.hw.join(", ") : "No working hardware encoder found"}>
-        <input type="checkbox" checked={app.settings.use_hw} onchange={(e) => app.setSetting({ use_hw: e.currentTarget.checked })} />
-        Use GPU {app.info?.hw_ready ? (app.info.hw.length ? `(${app.info.hw.join(", ")})` : "(none found)") : "(checking…)"}
-      </label>
-    {/if}
-    <span class="msg" class:error={app.messageKind === "error"} role="status" aria-live="polite">{app.message}</span>
-    <span class="spacer"></span>
-    {#if app.info}<span class="ver">v{app.info.version}</span>{/if}
-    <button class="primary" disabled={!app.canStart || app.ffmpegMissing} onclick={() => app.startBatch()}>Start batch</button>
+      <button class="btn primary" disabled={!app.canStart || app.ffmpegMissing} onclick={() => app.startBatch()}>Start batch</button>
+    </div>
   </footer>
 </div>
 
@@ -93,26 +114,32 @@
   .app {
     display: grid;
     height: 100vh;
-    grid-template-columns: 250px 1fr 270px;
-    grid-template-rows: 44px 1fr 48px;
+    grid-template-rows: 40px minmax(0, 1fr) 36px;
     grid-template-areas: "top top top" "side center insp" "bottom bottom bottom";
+    transition: grid-template-columns 0.15s ease;
   }
-  .top { grid-area: top; display: flex; align-items: center; gap: 16px; padding: 0 14px; background: var(--panel); border-bottom: 1px solid var(--line); }
-  .brand { font-weight: 700; color: var(--accent); }
-  .tabs { margin: 0 auto; display: flex; background: var(--panel-2); border-radius: 8px; padding: 2px; }
-  .tabs button { background: none; border: 0; padding: 5px 16px; border-radius: 6px; color: var(--muted); }
-  .tabs button.on { background: var(--bg); color: var(--text); }
-  .ghost { background: none; border: 1px solid var(--line); border-radius: 6px; padding: 5px 12px; }
-  .center { grid-area: center; display: grid; grid-template-rows: auto 1fr; min-width: 0; min-height: 0; overflow: hidden; }
-  .warn { grid-column: 1; background: #5a2a1f; color: #ffd9cf; padding: 8px 14px; }
-  .bottom { grid-area: bottom; display: flex; align-items: center; gap: 14px; padding: 0 14px; background: var(--panel); border-top: 1px solid var(--line); }
-  .spacer { flex: 1; }
-  .msg { color: var(--muted); }
+  .top {
+    grid-area: top; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; padding: 0 10px;
+    background: var(--panel); border-bottom: 1px solid #000a; box-shadow: 0 1px 0 var(--line-soft);
+  }
+  .left, .right { display: flex; align-items: center; gap: 10px; }
+  .right { justify-content: flex-end; }
+  .brand { font-weight: 600; color: var(--muted); letter-spacing: 0.02em; }
+  .icon-btn.on { color: var(--accent); }
+  .tabs button { min-width: 92px; }
+  .pane-left { grid-area: side; min-width: 0; overflow: hidden; border-right: 1px solid #000a; }
+  .pane-right { grid-area: insp; min-width: 0; overflow: hidden; border-left: 1px solid #000a; }
+  .hidden { visibility: hidden; border: 0; }
+  .center { grid-area: center; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: var(--bg); }
+  .warn { background: #4a2a12; color: #ffd8b0; padding: 6px 12px; border-bottom: 1px solid #000a; }
+  .bottom {
+    grid-area: bottom; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 10px;
+    background: var(--panel); border-top: 1px solid #000a;
+  }
+  .b-left, .b-right { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .b-right label { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+  .plus { font-size: 15px; }
+  .msg { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .msg.error { color: var(--danger); }
-  .ver { color: var(--muted); }
-  .hwl { display: flex; align-items: center; gap: 6px; }
-  select { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; margin-left: 6px; }
-  .primary { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 6px; padding: 7px 18px; font-weight: 600; }
-  .primary:disabled { opacity: 0.4; cursor: default; }
   code { background: #0004; padding: 0 4px; border-radius: 3px; }
 </style>

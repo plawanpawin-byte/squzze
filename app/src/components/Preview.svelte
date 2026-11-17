@@ -13,6 +13,8 @@
   const info = $derived(app.current?.info ?? null);
   const duration = $derived(info?.duration_secs ?? 0);
   const hasVideo = $derived(!!info?.video);
+  const fps = $derived(info?.video?.fps ?? 30);
+  const pct = $derived(duration > 0 ? (pos / duration) * 100 : 0);
 
   $effect(() => {
     const path = app.current?.path;
@@ -30,42 +32,86 @@
       } finally {
         if (my === seq) loading = false;
       }
-    }, 200);
+    }, 150);
     return () => clearTimeout(timer);
   });
 
   $effect(() => { app.current?.path; pos = 0; });
 
-  function step(d: number) { pos = Math.min(Math.max(0, pos + d), Math.max(0, duration - 0.04)); }
+  function step(d: number) { pos = Math.min(Math.max(0, pos + d), Math.max(0, duration - 1 / fps)); }
 </script>
 
-<section class="preview" aria-label="Preview">
+<section class="viewer" aria-label="Preview">
+  <div class="vbar">
+    <span class="spacer"></span>
+    <span class="title" title={app.current?.path ?? ""}>{app.current?.name ?? "No file selected"}</span>
+    <span class="spacer right">
+      {#if info?.video}<span class="chip">{info.video.width}×{info.video.height}</span>{/if}
+      <span class="chip">Fit</span>
+    </span>
+  </div>
+
   <div class="frame">
     {#if img}
       <img src={img} alt="Frame of {app.current?.name} at {fmtTimecode(pos)}" />
     {:else if !app.current}
-      <span>Drop files here or click “Add files…”</span>
+      <div class="drop">
+        <svg width="40" height="40" viewBox="0 0 40 40" aria-hidden="true"><rect x="4" y="9" width="32" height="22" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M20 14v12M14 20h12" stroke="currentColor" stroke-width="1.6"/></svg>
+        <span>Drop video or audio files here</span>
+        <button class="link" onclick={() => app.pickAndAdd()}>or choose files…</button>
+      </div>
     {:else if !hasVideo}
-      <span>Audio only — no picture</span>
+      <span class="muted">Audio only — no picture</span>
     {:else}
-      <span>{loading ? "Loading frame…" : (err ?? "")}</span>
+      <span class="muted">{loading ? "Loading frame…" : (err ?? "")}</span>
     {/if}
   </div>
-  <input class="scrub" type="range" min="0" max={Math.max(duration, 0.1)} step="0.04" bind:value={pos} disabled={!hasVideo} aria-label="Position in the file" />
+
+  <div class="timeline" style:--pct="{pct}%">
+    <input class="scrub" type="range" min="0" max={Math.max(duration, 0.1)} step={1 / fps} bind:value={pos} disabled={!hasVideo} aria-label="Position in the file" />
+  </div>
+
   <div class="transport">
-    <button aria-label="Back 1 second" disabled={!hasVideo} onclick={() => step(-1)}>−1s</button>
-    <span class="tc" aria-live="off">{fmtTimecode(pos)}</span>
-    <button aria-label="Forward 1 second" disabled={!hasVideo} onclick={() => step(1)}>+1s</button>
+    <div class="tleft"></div>
+    <div class="tmid">
+      <button class="icon-btn" aria-label="Back 1 second" title="Back 1 s" disabled={!hasVideo} onclick={() => step(-1)}>
+        <svg width="16" height="12" viewBox="0 0 16 12" aria-hidden="true"><path d="M8 1 2 6l6 5zM15 1 9 6l6 5z" fill="currentColor"/></svg>
+      </button>
+      <button class="icon-btn" aria-label="Previous frame" title="Previous frame" disabled={!hasVideo} onclick={() => step(-1 / fps)}>
+        <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 1v10M11 1 4 6l7 5z" fill="currentColor" stroke="currentColor" stroke-width="1.2"/></svg>
+      </button>
+      <span class="tc" aria-live="off">{fmtTimecode(pos)}</span>
+      <button class="icon-btn" aria-label="Next frame" title="Next frame" disabled={!hasVideo} onclick={() => step(1 / fps)}>
+        <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M10 1v10M1 1l7 5-7 5z" fill="currentColor" stroke="currentColor" stroke-width="1.2"/></svg>
+      </button>
+      <button class="icon-btn" aria-label="Forward 1 second" title="Forward 1 s" disabled={!hasVideo} onclick={() => step(1)}>
+        <svg width="16" height="12" viewBox="0 0 16 12" aria-hidden="true"><path d="M1 1l6 5-6 5zM8 1l6 5-6 5z" fill="currentColor"/></svg>
+      </button>
+    </div>
+    <div class="tright">{#if duration}<span class="muted">{fmtTimecode(duration)}</span>{/if}</div>
   </div>
 </section>
 
 <style>
-  .preview { padding: 12px; border-bottom: 1px solid var(--line); }
-  .frame { height: 250px; display: grid; place-items: center; background: #000; border-radius: 8px; color: #6c7488; overflow: hidden; }
-  .frame img { max-width: 100%; max-height: 100%; object-fit: contain; }
-  .scrub { width: 100%; margin: 10px 0 4px; accent-color: var(--accent); }
-  .transport { display: flex; align-items: center; justify-content: center; gap: 12px; }
-  .transport button { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; }
-  .transport button:disabled { opacity: 0.4; cursor: default; }
-  .tc { font-variant-numeric: tabular-nums; font-size: 18px; min-width: 110px; text-align: center; }
+  .viewer { flex: none; display: flex; flex-direction: column; border-bottom: 1px solid #000a; background: var(--bg); }
+  .vbar { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; padding: 4px 10px; color: var(--muted); }
+  .title { color: var(--text); font-weight: 500; max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .spacer.right { display: flex; justify-content: flex-end; gap: 6px; }
+  .chip { background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; padding: 0 6px; font-size: 11px; }
+  .frame { height: clamp(170px, 38vh, 440px); margin: 0 10px; display: grid; place-items: center; background: var(--frame); overflow: hidden; }
+  .frame img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+  .drop { display: grid; justify-items: center; gap: 6px; color: var(--faint); }
+  .timeline { margin: 6px 10px 0; position: relative; }
+  .scrub { -webkit-appearance: none; appearance: none; width: 100%; height: 14px; background: transparent; margin: 0; }
+  .scrub::-webkit-slider-runnable-track {
+    height: 6px; border-radius: 3px;
+    background: linear-gradient(90deg, var(--accent) 0 var(--pct), var(--panel-3) var(--pct) 100%);
+  }
+  .scrub::-webkit-slider-thumb { -webkit-appearance: none; width: 3px; height: 14px; margin-top: -4px; background: var(--marker); border-radius: 1px; }
+  .scrub:disabled::-webkit-slider-runnable-track { background: var(--panel-2); }
+  .transport { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; padding: 4px 10px 8px; }
+  .tmid { display: flex; align-items: center; gap: 4px; }
+  .tright { display: flex; justify-content: flex-end; font-variant-numeric: tabular-nums; }
+  .icon-btn:disabled { opacity: 0.35; cursor: default; }
+  .tc { font-variant-numeric: tabular-nums; font-size: 15px; letter-spacing: 0.04em; background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; padding: 2px 12px; margin: 0 6px; min-width: 120px; text-align: center; }
 </style>

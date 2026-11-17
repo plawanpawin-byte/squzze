@@ -1,48 +1,113 @@
 <script lang="ts">
   import { app } from "$lib/app.svelte";
-  import { fmtBytes, fmtDuration } from "$lib/format";
+  import { fmtBytes, fmtDuration, fmtTimecode } from "$lib/format";
 
   type Row = [string, string];
+  let closed = $state<Record<string, boolean>>({});
+
+  const info = $derived(app.tab === "current" ? (app.current?.info ?? null) : null);
+  const out = $derived.by(() => {
+    const s = app.current;
+    const o = s?.outputs.find((x) => x.uid === app.selectedOutput) ?? s?.outputs[0];
+    return o ? app.preset(o.presetId) ?? null : null;
+  });
+  const container = (f: string) => {
+    const k = f.split(",")[0];
+    return ({ mov: "QuickTime movie", matroska: "Matroska", webm: "WebM", wav: "WAVE audio", flac: "FLAC audio", mp3: "MP3 audio", ogg: "Ogg", avi: "AVI" } as Record<string, string>)[k] ?? k.toUpperCase();
+  };
+  const summary = $derived.by(() => {
+    if (!info) return [] as string[];
+    const l: string[] = [container(info.format_name)];
+    if (info.video) l.push(`Video: ${info.video.codec.toUpperCase()}, ${info.video.width}×${info.video.height}${info.video.fps ? `, ${info.video.fps} fps` : ""}`);
+    if (info.audio) l.push(`Audio: ${info.audio.codec.toUpperCase()}, ${info.audio.channels} ch${info.audio.sample_rate ? `, ${(info.audio.sample_rate / 1000).toFixed(1)} kHz` : ""}`);
+    l.push(`Duration: ${fmtDuration(info.duration_secs)} · ${fmtBytes(info.size_bytes)}`);
+    return l;
+  });
   const sections = $derived.by(() => {
-    const i = app.current?.info;
-    if (!i) return [] as { title: string; rows: Row[] }[];
-    const out: { title: string; rows: Row[] }[] = [
-      { title: "File", rows: [["Name", i.file_name], ["Container", i.format_name.split(",")[0]], ["Size", fmtBytes(i.size_bytes)], ["Duration", fmtDuration(i.duration_secs)], ["Bit rate", i.bit_rate ? `${Math.round(i.bit_rate / 1000)} kbit/s` : "—"]] },
-    ];
-    if (i.video) out.push({ title: "Video", rows: [["Codec", i.video.codec], ["Resolution", `${i.video.width}×${i.video.height}`], ["Frame rate", i.video.fps ? `${i.video.fps} fps` : "—"], ["Pixel format", i.video.pix_fmt ?? "—"], ["Field order", i.video.field_order ?? "—"]] });
-    if (i.audio) out.push({ title: "Audio", rows: [["Codec", i.audio.codec], ["Channels", String(i.audio.channels)], ["Sample rate", i.audio.sample_rate ? `${i.audio.sample_rate} Hz` : "—"]] });
-    return out;
+    const s: { title: string; rows: Row[] }[] = [];
+    if (!info) return s;
+    s.push({ title: "Timing", rows: [["Start", fmtTimecode(0)], ["Duration", fmtTimecode(info.duration_secs ?? 0)]] });
+    s.push({ title: "File Properties", rows: [["Container", container(info.format_name)], ["Size", fmtBytes(info.size_bytes)], ["Bit rate", info.bit_rate ? `${Math.round(info.bit_rate / 1000)} kbit/s` : "—"]] });
+    if (info.video) s.push({ title: "Video Properties", rows: [["Codec", info.video.codec], ["Frame size", `${info.video.width}×${info.video.height}`], ["Frame rate", info.video.fps ? `${info.video.fps} fps` : "—"], ["Field order", info.video.field_order ?? "—"], ["Pixel format", info.video.pix_fmt ?? "—"]] });
+    if (info.audio) s.push({ title: "Audio Properties", rows: [["Codec", info.audio.codec], ["Channels", String(info.audio.channels)], ["Sample rate", info.audio.sample_rate ? `${info.audio.sample_rate} Hz` : "—"]] });
+    if (out) {
+      const r: Row[] = [["Preset", out.name], ["Container", `.${out.container}`]];
+      if (out.video) r.push(["Video", `${out.video.codec}${out.video.rate.mode === "crf" && out.video.rate.value ? ` · quality ${out.video.rate.value}` : out.video.rate.mode === "bitrate" ? ` · ${out.video.rate.value} kbit/s` : ""}`], ["Max height", out.video.max_height ? `${out.video.max_height} px` : "keep"]);
+      if (out.audio) r.push(["Audio", `${out.audio.codec}${out.audio.bitrate_kbps ? ` · ${out.audio.bitrate_kbps} kbit/s` : ""}`]);
+      r.push(["Location", app.dest ?? "Source folder"]);
+      s.push({ title: "Output", rows: r });
+    }
+    return s;
   });
 </script>
 
-<aside class="inspector" aria-label="Job inspector">
-  <h2>{app.tab === "current" ? "Source" : "Job"}</h2>
-  {#if app.tab !== "current" && app.job}
-    <h3>Job</h3>
-    <dl>
-      <dt>Status</dt><dd>{app.job.state}</dd>
-      <dt>Preset</dt><dd>{app.job.preset.name}</dd>
-      <dt>Container</dt><dd>.{app.job.preset.container}</dd>
-      <dt>Attempt</dt><dd>{app.job.attempt}</dd>
-      <dt>Destination</dt><dd>{app.job.dest_dir ?? "Same as source"}</dd>
-    </dl>
-  {:else if sections.length === 0}
-    <p class="muted">Select a file to see its properties.</p>
-  {/if}
-  {#if app.tab === "current"}
-    {#each sections as s}
-      <h3>{s.title}</h3>
-      <dl>{#each s.rows as [k, v]}<dt>{k}</dt><dd>{v}</dd>{/each}</dl>
-    {/each}
-  {/if}
+<aside class="inspector" aria-label="Inspector">
+  <div class="ihead">Job</div>
+  <div class="ibody">
+    {#if app.tab !== "current"}
+      {#if app.job}
+        <div class="file">
+          <span class="fico" aria-hidden="true"></span>
+          <div class="ftext">
+            <strong>{app.job.file_name}</strong>
+            <small class="path">{app.job.source}</small>
+          </div>
+        </div>
+        <section>
+          <h3>Job</h3>
+          <dl>
+            <dt>Status</dt><dd><span class="val">{app.job.state}</span></dd>
+            <dt>Preset</dt><dd><span class="val">{app.job.preset.name}</span></dd>
+            <dt>Attempt</dt><dd><span class="val">{app.job.attempt}</span></dd>
+            <dt>Destination</dt><dd><span class="val">{app.job.dest_dir ?? "Source folder"}</span></dd>
+            {#if app.job.output}<dt>Output</dt><dd><span class="val">{app.job.output}</span></dd>{/if}
+          </dl>
+        </section>
+      {:else}
+        <p class="none">Select a job to see its details.</p>
+      {/if}
+    {:else if info}
+      <div class="file">
+        <span class="fico" aria-hidden="true"></span>
+        <div class="ftext">
+          <strong>{info.file_name}</strong>
+          <small class="path">{info.path}</small>
+          {#each summary as l}<small>{l}</small>{/each}
+        </div>
+      </div>
+      {#each sections as s}
+        <section>
+          <h3><button class="sh" aria-expanded={!closed[s.title]} onclick={() => (closed[s.title] = !closed[s.title])}>{s.title}<span aria-hidden="true">{closed[s.title] ? "▸" : "▾"}</span></button></h3>
+          {#if !closed[s.title]}
+            <dl>{#each s.rows as [k, v]}<dt>{k}</dt><dd><span class="val" title={v}>{v}</span></dd>{/each}</dl>
+          {/if}
+        </section>
+      {/each}
+    {:else}
+      <p class="none">Select a file to see its properties.</p>
+    {/if}
+  </div>
 </aside>
 
 <style>
-  .inspector { grid-area: insp; background: var(--panel); border-left: 1px solid var(--line); overflow: auto; padding: 10px 14px; }
-  h2 { font-size: 13px; margin: 0 0 8px; }
-  h3 { font-size: 12px; color: var(--muted); margin: 14px 0 4px; text-transform: uppercase; letter-spacing: 0.04em; }
-  dl { display: grid; grid-template-columns: 1fr 1.4fr; gap: 4px 8px; margin: 0; }
-  dt { color: var(--muted); }
-  dd { margin: 0; text-align: right; word-break: break-all; }
-  .muted { color: var(--muted); }
+  .inspector { height: 100%; display: flex; flex-direction: column; background: var(--panel); }
+  .ihead { padding: 9px 12px; font-weight: 600; border-bottom: 1px solid var(--line-soft); }
+  .ibody { flex: 1; min-height: 0; overflow: auto; }
+  .file { display: flex; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--line-soft); }
+  .fico { width: 26px; height: 32px; flex: none; border-radius: 3px; background: linear-gradient(160deg, #3a3a3c, #2a2a2c); border: 1px solid var(--line); position: relative; }
+  .fico::after { content: ""; position: absolute; left: 7px; top: 10px; border-left: 9px solid var(--muted); border-top: 6px solid transparent; border-bottom: 6px solid transparent; }
+  .ftext { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .ftext strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ftext small { color: var(--muted); font-size: 11px; line-height: 1.45; }
+  .path { word-break: break-all; color: var(--faint) !important; }
+  section { border-bottom: 1px solid var(--line-soft); padding: 2px 0 8px; }
+  h3 { margin: 0; }
+  .sh { width: 100%; display: flex; justify-content: space-between; align-items: center; background: none; border: 0; padding: 7px 12px 5px; font-weight: 600; font-size: 12px; color: var(--text); }
+  section > h3:not(:has(.sh)) { padding: 7px 12px 5px; font-size: 12px; }
+  .sh span { color: var(--faint); font-size: 10px; }
+  dl { display: grid; grid-template-columns: 92px 1fr; gap: 4px 8px; margin: 0; padding: 0 12px; align-items: center; }
+  dt { color: var(--muted); text-align: right; }
+  dd { margin: 0; min-width: 0; }
+  .val { display: block; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .none { color: var(--faint); padding: 12px; }
 </style>

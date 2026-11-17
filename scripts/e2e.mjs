@@ -97,7 +97,7 @@ try {
   check("dropped files are probed; corrupt one is flagged", loaded);
   const t1 = await text(page);
   check("video and audio sources listed", t1.includes("ทดสอบ clip.mp4") && t1.includes("tone.wav"));
-  check("probe shows codec/resolution", t1.includes("h264 1280×720"));
+  check("probe shows codec/resolution", t1.includes("h264 · 1280×720"));
   await sleep(1200);
   await page.shot("01-loaded.png");
   const hasImg = await page.eval("!!document.querySelector('.frame img')");

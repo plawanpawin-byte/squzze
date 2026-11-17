@@ -55,20 +55,23 @@
 </section>
 
 <style>
-  .queue { overflow: auto; padding: 10px 12px; display: grid; gap: 10px; align-content: start; grid-row: 1 / span 2; }
-  .bar { display: flex; gap: 8px; }
-  .bar button, .acts button { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 12px; }
-  .empty { color: var(--muted); padding: 24px; text-align: center; }
-  .job { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; display: grid; gap: 4px; }
-  .job.sel { border-color: var(--accent); }
-  .head { background: none; border: 0; text-align: left; padding: 0; display: flex; gap: 8px; align-items: baseline; }
-  .p { color: var(--muted); flex: 1; }
-  .st { font-size: 12px; padding: 1px 8px; border-radius: 10px; background: var(--panel-2); }
+  .queue { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
+  .bar { position: sticky; top: 0; z-index: 1; display: flex; gap: 6px; padding: 5px 10px; background: var(--panel); border-bottom: 1px solid var(--line-soft); }
+  .bar button, .acts button { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 2px 10px; }
+  .bar button:hover, .acts button:hover { background: var(--panel-3); }
+  .empty { color: var(--faint); padding: 28px; text-align: center; }
+  .job { margin: 8px 10px 0; background: var(--panel); border: 1px solid var(--line-soft); border-radius: 7px; padding: 7px 10px; display: grid; gap: 4px; }
+  .job.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-soft); }
+  .head { background: none; border: 0; text-align: left; padding: 0; display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+  .head strong { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .p { color: var(--muted); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .st { font-size: 11px; padding: 0 8px; border-radius: 9px; background: var(--panel-3); color: var(--muted); }
   .st.running { background: var(--accent); color: var(--accent-ink); }
+  .st.done { background: #1f6f43; color: #d6ffe6; }
   .st.failed { background: var(--danger); color: #fff; }
-  .meter { height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
+  .meter { height: 5px; background: var(--panel-3); border-radius: 3px; overflow: hidden; }
   .fill { height: 100%; background: var(--accent); transition: width 0.25s; }
-  small { color: var(--muted); word-break: break-all; }
+  small { color: var(--muted); font-size: 11px; word-break: break-all; }
   .err { color: var(--danger); }
-  .acts { display: flex; gap: 8px; margin-top: 2px; }
+  .acts { display: flex; gap: 6px; margin-top: 2px; }
 </style>
