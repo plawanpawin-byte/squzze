@@ -4,8 +4,10 @@ pub mod args;
 pub mod outpath;
 pub mod preset;
 pub mod run;
+pub mod verify;
 
-pub use args::{build_args, HwKind};
+pub use args::{build_args, build_args_trim, HwKind, Trim};
 pub use outpath::{plan_output, temp_path, Overwrite, PlanError};
 pub use preset::{builtin_presets, AudioCodec, AudioSpec, Preset, PresetError, RateControl, VideoCodec, VideoSpec};
-pub use run::{detect_hw, ffmpeg_version, preview_frame, run_encode, Progress, RunError};
+pub use run::{detect_hw, ffmpeg_version, preview_frame, run_encode, run_encode_logged, Progress, RunError};
+pub use verify::{verify_output, Verify};

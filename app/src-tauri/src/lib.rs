@@ -205,7 +205,14 @@ async fn preview(state: State<'_, AppState>, path: String, secs: f64) -> Result<
 }
 
 #[tauri::command]
-async fn add_job(state: State<'_, AppState>, source: String, preset_id: String, dest_dir: Option<String>) -> Result<u64, String> {
+async fn add_job(
+    state: State<'_, AppState>,
+    source: String,
+    preset_id: String,
+    dest_dir: Option<String>,
+    start_secs: Option<f64>,
+    end_secs: Option<f64>,
+) -> Result<u64, String> {
     if state.queue.jobs().len() >= MAX_JOBS {
         return Err("queue is full".into());
     }
@@ -219,7 +226,7 @@ async fn add_job(state: State<'_, AppState>, source: String, preset_id: String, 
         .await
         .map_err(|e| e.to_string())?;
     let settings = state.settings.lock().unwrap().clone();
-    state.queue.add(NewJob { source, duration_secs: duration, preset, dest_dir, template: None, overwrite: None }, &settings)
+    state.queue.add(NewJob { source, duration_secs: duration, preset, dest_dir, template: None, overwrite: None, start_secs, end_secs }, &settings)
 }
 
 #[tauri::command]
@@ -314,7 +321,7 @@ pub fn run() {
             let hw_ready = Arc::new(AtomicBool::new(false));
 
             let encoder: Arc<dyn Encoder> = match &ffmpeg {
-                Some(f) => Arc::new(FfmpegEncoder { ffmpeg: f.clone(), hw: hw.clone(), settings: settings.clone() }),
+                Some(f) => Arc::new(FfmpegEncoder { ffmpeg: f.clone(), ffprobe: ffprobe.clone(), hw: hw.clone(), settings: settings.clone() }),
                 None => Arc::new(MissingEncoder),
             };
             let handle = app.handle().clone();

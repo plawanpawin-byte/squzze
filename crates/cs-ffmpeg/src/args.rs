@@ -113,13 +113,42 @@ fn audio_args(a: &AudioSpec, out: &mut Vec<String>) {
     }
 }
 
+/// Optional in/out points (seconds) applied to the source.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Trim {
+    pub start: Option<f64>,
+    pub end: Option<f64>,
+}
+
+impl Trim {
+    pub fn is_none(&self) -> bool {
+        self.start.is_none() && self.end.is_none()
+    }
+}
+
 /// Build the full argument list. `input`/`output` must be absolute paths.
 pub fn build_args(preset: &Preset, input: &Path, output: &Path, hw: Option<HwKind>) -> Vec<String> {
-    let mut a: Vec<String> = ["-hide_banner", "-nostdin", "-y", "-nostats", "-progress", "pipe:1", "-protocol_whitelist", "file", "-i"]
+    build_args_trim(preset, input, output, hw, Trim::default())
+}
+
+/// Same as [`build_args`] with optional trimming. `-ss` before `-i` (fast + accurate when re-encoding),
+/// `-t` as an output option so the length is exact.
+pub fn build_args_trim(preset: &Preset, input: &Path, output: &Path, hw: Option<HwKind>, trim: Trim) -> Vec<String> {
+    let mut a: Vec<String> = ["-hide_banner", "-nostdin", "-y", "-nostats", "-progress", "pipe:1", "-protocol_whitelist", "file"]
         .iter()
         .map(|x| x.to_string())
         .collect();
+    if let Some(st) = trim.start.filter(|v| v.is_finite() && *v > 0.0) {
+        a.extend([s("-ss"), format!("{st:.3}")]);
+    }
+    a.push(s("-i"));
     a.push(input.to_string_lossy().into_owned());
+    if let Some(end) = trim.end.filter(|v| v.is_finite() && *v > 0.0) {
+        let len = end - trim.start.unwrap_or(0.0).max(0.0);
+        if len > 0.0 {
+            a.extend([s("-t"), format!("{len:.3}")]);
+        }
+    }
     a.extend([s("-sn"), s("-dn"), s("-map_metadata"), s("0")]);
 
     if let Some(v) = &preset.video {
@@ -219,6 +248,21 @@ mod tests {
         assert!(a.contains(&"-vn".to_string()));
         assert!(has_pair(&a, "-c:a", "flac"));
         assert!(!a.iter().any(|x| x == "-c:v"));
+    }
+
+    #[test]
+    fn trim_adds_seek_and_length() {
+        let p = get("h264-1080");
+        let a = build_args_trim(&p, Path::new("C:/in.mov"), Path::new("C:/o.mp4"), None, Trim { start: Some(2.5), end: Some(7.0) });
+        let ss = a.iter().position(|x| x == "-ss").unwrap();
+        let i = a.iter().position(|x| x == "-i").unwrap();
+        assert!(ss < i, "-ss must come before -i");
+        assert_eq!(a[ss + 1], "2.500");
+        assert!(has_pair(&a, "-t", "4.500"));
+        let none = build_args_trim(&p, Path::new("C:/in.mov"), Path::new("C:/o.mp4"), None, Trim::default());
+        assert!(!none.contains(&"-ss".to_string()) && !none.contains(&"-t".to_string()));
+        let bad = build_args_trim(&p, Path::new("C:/in.mov"), Path::new("C:/o.mp4"), None, Trim { start: Some(9.0), end: Some(3.0) });
+        assert!(!bad.contains(&"-t".to_string()), "end before start must not produce -t");
     }
 
     #[test]

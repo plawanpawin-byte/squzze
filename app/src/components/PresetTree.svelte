@@ -14,6 +14,10 @@
   const groups = $derived(builtinGroups.map((g) => ({ name: g, items: app.presets.filter((p) => p.group === g && match(p)) })).filter((g) => !q || g.items.length));
   const custom = $derived(app.presets.filter((p) => p.group === "Custom" && match(p)));
 
+  const exampleName = $derived(
+    ((app.settings?.template || "{name}-{preset}").replace("{name}", "clip").replace("{preset}", "h264-1080")).replace(/[\\/:*?"<>|]/g, "_") + ".mp4",
+  );
+
   function add(id: string) {
     picked = id;
     app.addOutput(id);
@@ -84,6 +88,25 @@
         <li class="row"><button class="leaf act" onclick={() => app.chooseDest()}>Choose folder…</button></li>
       </ul>
       <p class="hint">Outputs of the next batch are saved here.</p>
+      {#if app.settings}
+        <div class="sect">File names</div>
+        <div class="form">
+          <label>Name template
+            <input class="field" value={app.settings.template} maxlength="120" aria-label="Output name template"
+              onchange={(e) => app.setSetting({ template: e.currentTarget.value })} />
+          </label>
+          <p class="hint tight">Use <code>{"{name}"}</code> for the source name and <code>{"{preset}"}</code> for the preset id. Example: <code>{exampleName}</code></p>
+          <label>If the file already exists
+            <select class="field" value={app.settings.overwrite} aria-label="If the output file already exists"
+              onchange={(e) => app.setSetting({ overwrite: e.currentTarget.value as "rename" | "replace" | "skip" })}>
+              <option value="rename">Keep both (add a number)</option>
+              <option value="skip">Skip — fail the job</option>
+              <option value="replace">Replace the old file</option>
+            </select>
+          </label>
+          {#if app.settings.overwrite === "replace"}<p class="hint tight warnc">Existing files with the same name will be overwritten. The source file is never overwritten.</p>{/if}
+        </div>
+      {/if}
     {/if}
   </div>
 
@@ -122,4 +145,10 @@
   .empty, .hint { color: var(--faint); padding: 3px 8px; list-style: none; }
   .foot { display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-top: 1px solid var(--line-soft); }
   .search { flex: 1; min-width: 0; }
+  .form { display: grid; gap: 8px; padding: 2px 8px 10px; }
+  .form label { display: grid; gap: 3px; color: var(--muted); }
+  .form .field { width: 100%; }
+  .tight { padding: 0; margin: -2px 0 0; font-size: 11px; line-height: 1.4; }
+  .warnc { color: var(--warn); }
+  code { background: var(--panel-3); border-radius: 3px; padding: 0 3px; }
 </style>

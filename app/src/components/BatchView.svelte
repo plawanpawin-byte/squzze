@@ -37,6 +37,7 @@
             </span>
             <span class="meta">
               <strong>{s.name}</strong>
+              {#if s.info && (s.inPt != null || s.outPt != null)}<small class="mark">Range {fmtDuration(s.inPt ?? 0)} – {s.outPt != null ? fmtDuration(s.outPt) : "end"}</small>{/if}
               {#if s.info}
                 <small>
                   {s.info.video ? `${s.info.video.codec} · ${s.info.video.width}×${s.info.video.height}${s.info.video.fps ? ` · ${s.info.video.fps} fps` : ""}` : "audio"}{s.info.audio ? ` · ${s.info.audio.codec} ${s.info.audio.channels} ch` : ""} · {fmtDuration(s.info.duration_secs)}
@@ -97,6 +98,7 @@
   .meta strong { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .meta small { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .bad { color: var(--danger) !important; white-space: normal !important; }
+  .mark { color: var(--marker) !important; }
   .add { margin-right: 6px; }
   table { width: 100%; border-collapse: collapse; table-layout: fixed; }
   th { text-align: left; color: var(--faint); font-weight: 500; font-size: 11px; padding: 3px 10px; border-top: 1px solid var(--line-soft); background: var(--bg); }

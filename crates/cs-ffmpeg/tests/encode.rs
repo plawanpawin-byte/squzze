@@ -148,3 +148,47 @@ fn hardware_detection_runs_and_hw_encode_works_if_present() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+fn user_recording() -> Option<PathBuf> {
+    let p = std::env::var_os("SQUEEZE_TEST_FILE").map(PathBuf::from).or_else(|| {
+        std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("Downloads").join("Recording 2026-10-22 200301-hevc-1080.mp4"))
+    })?;
+    p.is_file().then_some(p)
+}
+
+#[test]
+fn real_screen_recording_converts_and_verifies() {
+    let Some((ffmpeg, ffprobe)) = tools() else { return };
+    let Some(src) = user_recording() else {
+        eprintln!("SKIP: sample recording not present");
+        return;
+    };
+    let info = probe(&ffprobe, &src).unwrap();
+    let dur = info.duration_secs.unwrap();
+    let dir = workdir("real");
+    for id in ["h264-1080", "hevc-1080", "social-720", "vp9-1080-webm", "aac-256", "flac"] {
+        let p = builtin_presets().into_iter().find(|p| p.id == id).unwrap();
+        let out = encode(&ffmpeg, &p, &src, &dir, dur, None).unwrap_or_else(|e| panic!("{id}: {e}"));
+        let oi = probe(&ffprobe, &out).unwrap();
+        let v = verify_output(&oi, &p, Some(dur), info.audio.is_some());
+        assert!(v.ok, "{id}: {:?}", v.notes);
+        eprintln!("{id}: {} -> {} bytes ({}x{:?})", info.size_bytes.unwrap(), v.size_bytes.unwrap(), v.width.unwrap_or(0), v.height);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn trim_produces_exact_length_on_real_recording() {
+    let Some((ffmpeg, ffprobe)) = tools() else { return };
+    let Some(src) = user_recording() else { return };
+    let dir = workdir("trim");
+    let p = builtin_presets().into_iter().find(|p| p.id == "h264-720").unwrap();
+    let out = dir.join("trimmed.mp4");
+    let args = build_args_trim(&p, &src, &out, None, Trim { start: Some(5.0), end: Some(10.0) });
+    run_encode(&ffmpeg, &args, Some(5.0), &AtomicBool::new(false), |_| {}).unwrap();
+    let oi = probe(&ffprobe, &out).unwrap();
+    let d = oi.duration_secs.unwrap();
+    assert!((d - 5.0).abs() < 0.3, "trimmed duration {d}");
+    assert!(oi.video.unwrap().height <= 720);
+    let _ = std::fs::remove_dir_all(&dir);
+}

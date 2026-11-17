@@ -223,6 +223,8 @@ pub fn builtin_presets() -> Vec<Preset> {
         p("h264-1080", "H.264 MP4 — 1080p", "Web", "mp4", v(V::H264, Crf(21), Some(1080)), a(A::Aac, Some(192))),
         p("h264-720", "H.264 MP4 — 720p", "Web", "mp4", v(V::H264, Crf(22), Some(720)), a(A::Aac, Some(160))),
         p("hevc-1080", "HEVC MP4 — 1080p", "Web", "mp4", v(V::Hevc, Crf(24), Some(1080)), a(A::Aac, Some(192))),
+        p("h264-1080-small", "H.264 MP4 — 1080p (smaller file)", "Web", "mp4", v(V::H264, Crf(26), Some(1080)), a(A::Aac, Some(128))),
+        p("hevc-1080-small", "HEVC MP4 — 1080p (smaller file)", "Web", "mp4", v(V::Hevc, Crf(28), Some(1080)), a(A::Aac, Some(128))),
         p("av1-1080-webm", "AV1 WebM — 1080p", "Web", "webm", v(V::Av1, Crf(34), Some(1080)), a(A::Opus, Some(128))),
         p("vp9-1080-webm", "VP9 WebM — 1080p", "Web", "webm", v(V::Vp9, Crf(32), Some(1080)), a(A::Opus, Some(128))),
         p("social-720", "Social share 720p (small)", "Social", "mp4", v(V::H264, Crf(26), Some(720)), a(A::Aac, Some(128))),

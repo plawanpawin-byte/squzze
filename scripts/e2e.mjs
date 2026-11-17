@@ -47,6 +47,18 @@ async function connect() {
             if (r.result?.exceptionDetails) throw new Error(JSON.stringify(r.result.exceptionDetails.exception?.description ?? r.result.exceptionDetails));
             return r.result?.result?.value;
           },
+          async mouse(type, x, y) {
+            await send("Input.dispatchMouseEvent", { type, x, y, button: "left", buttons: type === "mouseReleased" ? 0 : 1, clickCount: 1 });
+          },
+          async viewport(w, h) {
+            await send("Emulation.setDeviceMetricsOverride", { width: w, height: h, deviceScaleFactor: 1, mobile: false });
+          },
+          async scheme(v) {
+            await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: v }] });
+          },
+          async reload() {
+            await send("Page.reload");
+          },
           async shot(name) {
             const r = await send("Page.captureScreenshot", { format: "png" });
             writeFileSync(join(shots, name), Buffer.from(r.result.data, "base64"));
@@ -59,9 +71,12 @@ async function connect() {
   throw new Error("could not connect to WebView2 devtools");
 }
 
+async function send_key(page, key) {
+  await page.eval(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key:${JSON.stringify(key)}, bubbles:true}))`);
+}
 const inv = (page, cmd, args = {}) =>
   page.eval(`window.__TAURI_INTERNALS__.invoke(${JSON.stringify(cmd)}, ${JSON.stringify(args)}).then(v => ({ok:true, v}), e => ({ok:false, e:String(e)}))`);
-const text = (page) => page.eval("document.body.innerText");
+const text = (page) => page.eval("document.body?.innerText ?? ''");
 async function waitFor(fn, ms = 60000, step = 250) {
   const t0 = Date.now();
   while (Date.now() - t0 < ms) { const v = await fn(); if (v) return v; await sleep(step); }
@@ -215,6 +230,185 @@ try {
   check("no filesystem plugin reachable from the page", !fsPerm.ok, fsPerm.e);
   const shellPerm = await inv(page, "plugin:shell|execute", { program: "cmd" });
   check("no shell plugin reachable from the page", !shellPerm.ok, shellPerm.e);
+
+  // ================= UI behaviour + the user's real recording =================
+  const rec = process.env.SQUEEZE_TEST_FILE ?? join(process.env.USERPROFILE ?? "", "Downloads", "Recording 2026-10-22 200301-hevc-1080.mp4");
+  const dragPayload = (paths) => `window.__TAURI_INTERNALS__.invoke('plugin:event|emit', {event:'tauri://drag-drop', payload:{paths:${JSON.stringify(paths)}, position:{x:5,y:5}}})`;
+  await clickText(page, "[role=tab]", "Current");
+  await sleep(300);
+  const t0txt = await text(page);
+  check("Start batch explains why it is disabled", t0txt.includes("Add a file first") || t0txt.includes("Pick at least"), "hint text present");
+
+  // drag overlay
+  await page.eval(`window.__TAURI_INTERNALS__.invoke('plugin:event|emit', {event:'tauri://drag-enter', payload:{paths:[], position:{x:1,y:1}}})`);
+  await sleep(200);
+  check("drag-over shows the drop overlay", await page.eval("!!document.querySelector('.dropveil')"));
+  await page.eval(`window.__TAURI_INTERNALS__.invoke('plugin:event|emit', {event:'tauri://drag-leave', payload:null})`);
+  await sleep(200);
+  check("overlay goes away on leave", !(await page.eval("!!document.querySelector('.dropveil')")));
+
+  // splitters: drag, clamp, persist, reset
+  const geo = () => page.eval(`(() => { const q = (s) => document.querySelector(s)?.getBoundingClientRect(); const L = q('.pane'); const S = [...document.querySelectorAll('[role=separator]')].map(e => e.getBoundingClientRect()); return { left: L?.width, seps: S.map(r => ({x: r.x + r.width/2, y: r.y + r.height/2, w: r.width, h: r.height})) } })()`);
+  let g = await geo();
+  const w0 = g.left;
+  const sx = g.seps[0];
+  await page.mouse("mousePressed", sx.x, sx.y);
+  await page.mouse("mouseMoved", sx.x + 90, sx.y);
+  await page.mouse("mouseReleased", sx.x + 90, sx.y);
+  await sleep(250);
+  g = await geo();
+  check("dragging the left splitter widens the sidebar", g.left > w0 + 60, `${w0} -> ${g.left}`);
+  const sx2 = g.seps[0];
+  await page.mouse("mousePressed", sx2.x, sx2.y);
+  await page.mouse("mouseMoved", sx2.x + 900, sx2.y);
+  await page.mouse("mouseReleased", sx2.x + 900, sx2.y);
+  await sleep(250);
+  g = await geo();
+  check("sidebar width is clamped to its maximum", g.left <= 441, `width=${g.left}`);
+  await page.eval(`(() => { const e=[...document.querySelectorAll('[role=separator]')][0]; e.focus(); })()`);
+  await send_key(page, "ArrowLeft");
+  await sleep(150);
+  const stored = await page.eval(`localStorage.getItem('squeeze.layout.v1')`);
+  check("layout is saved", !!stored && JSON.parse(stored).leftW > 170, stored);
+  await page.reload();
+  await sleep(2500);
+  await waitFor(async () => (await text(page)).includes("Squeeze"), 15000);
+  g = await geo();
+  check("layout is restored after reload", Math.abs(g.left - JSON.parse(stored).leftW) < 2, `${g.left}`);
+  await page.eval(`(() => { const e=[...document.querySelectorAll('[role=separator]')][0]; e.dispatchEvent(new MouseEvent('dblclick', {bubbles:true})); })()`);
+  await sleep(250);
+  g = await geo();
+  check("double-click resets the sidebar width", Math.abs(g.left - 250) < 2, `${g.left}`);
+
+  // real recording through the UI with an in/out range
+  if (existsSync(rec)) {
+    await page.eval(dragPayload([rec]));
+    await waitFor(async () => (await text(page)).includes("Recording 2026-10-22"), 20000);
+    await sleep(800);
+    const tt = await text(page);
+    check("real recording probed (hevc 1496×852)", tt.includes("hevc") && tt.includes("1496×852"), "");
+    // type In / Out in the inspector
+    const setField = (label, val) => page.eval(`(() => { const el=document.querySelector('input[aria-label=${JSON.stringify(label)}]'); el.value=${JSON.stringify(val)}; el.dispatchEvent(new Event('change',{bubbles:true})); return el.value })()`);
+    const vin = await setField("In point", "0:05");
+    const vout = await setField("Out point", "0:10");
+    await sleep(300);
+    check("In/Out fields accept mm:ss and normalise", vin.startsWith("00:00:05") && vout.startsWith("00:00:10"), `${vin} / ${vout}`);
+    await setField("Out point", "0:03");
+    await sleep(200);
+    check("out point before in point is rejected", (await page.eval(`document.querySelector('input[aria-label="Out point"]').value`)).startsWith("00:00:10"));
+    check("trim range is shown on the file", (await text(page)).includes("Range 00:00:05"), "");
+    await page.shot("04-trim.png");
+    await clickText(page, ".leaf", "HEVC MP4 — 1080p (smaller");
+    await clickText(page, ".leaf", "VP9 WebM — 1080p");
+    await sleep(300);
+    const outRows = await page.eval("document.querySelectorAll('.source.sel tbody tr').length");
+    check("one source gets three outputs", outRows === 3, `rows=${outRows}`);
+    const before = (await inv(page, "queue_list")).v.map((j) => j.id);
+    await clickText(page, ".primary", "Start batch");
+    // observe the slow software VP9 job (AV1 uses NVENC here and finishes too fast to observe)
+    await waitFor(async () => (await inv(page, "queue_list")).v.some((j) => !before.includes(j.id) && j.preset.id === "vp9-1080-webm" && j.state === "running" && j.progress > 5), 120000);
+    // poll the UI while the job is running: all of encoder, percent and elapsed must be visible at some moment
+    const seen = { stats: false, overall: false, fake100: false };
+    let last = "";
+    await waitFor(async () => {
+      last = await text(page);
+      seen.stats ||= /Encoding with|Encoding in software/.test(last) && last.includes("elapsed") && /\d+%/.test(last);
+      seen.overall ||= /Encoding \d+\/\d+ · \d+%/.test(last);
+      if (/Encoding \d+\/\d+ · 100%/.test(last)) {
+        const running = (await inv(page, "queue_list")).v.some((j) => j.state === "running" || j.state === "queued");
+        seen.fake100 ||= running;
+      }
+      return seen.stats && seen.overall && last.length > 0 && !(await inv(page, "queue_list")).v.some((j) => j.state === "running" && j.progress < 99);
+    }, 15000, 120);
+    await page.shot("05-active.png");
+    check("Active tab shows encoder, percent and elapsed", seen.stats, last.replace(/\s+/g, " ").slice(200, 520));
+    check("overall progress appears in the footer", seen.overall, "");
+    check("overall bar never shows 100% while a job is still running", !seen.fake100, "");
+    const recJobs = await waitFor(async () => {
+      const js = (await inv(page, "queue_list")).v.filter((j) => !before.includes(j.id));
+      return js.length === 3 && js.every((j) => j.state === "done" || j.state === "failed") ? js : false;
+    }, 180000);
+    check("all three outputs of the recording finished", recJobs && recJobs.every((j) => j.state === "done"), recJobs ? recJobs.map((j) => j.preset.id + ":" + j.state).join(",") : "timeout");
+    if (recJobs) {
+      for (const j of recJobs) {
+        check(`${j.preset.id}: verified by ffprobe and 5 s long`, j.verify?.ok && Math.abs((j.verify.duration_secs ?? 0) - 5) < 0.4, JSON.stringify(j.verify?.notes ?? []) + ` dur=${j.verify?.duration_secs}`);
+        check(`${j.preset.id}: command line and log recorded`, (j.cmdline ?? "").includes("-ss 5.000") && (j.cmdline ?? "").includes("-t 5.000") && j.log.length > 0, (j.cmdline ?? "").slice(0, 60));
+        check(`${j.preset.id}: timing recorded`, j.started_ms && j.finished_ms && j.finished_ms >= j.started_ms, "");
+        const pj = probeJson(j.output);
+        check(`${j.preset.id}: independent ffprobe agrees`, Math.abs(Number(pj.format.duration) - 5) < 0.4 && pj.streams.some((s) => s.codec_type === "video"), j.output);
+      }
+      await clickText(page, "[role=tab]", "Completed");
+      await sleep(500);
+      const ct = await text(page);
+      check("Completed tab shows ✓ Verified and the range size (no misleading % for trimmed jobs)", ct.includes("✓ Verified") && ct.includes("for the selected range") && !/\(−\d+%\)/.test(ct.split("Range")[1] ?? ""), "");
+      await clickText(page, ".acts .btn", "Details");
+      await sleep(300);
+      const det = await page.eval("document.querySelector('pre.details')?.innerText ?? ''");
+      check("Details shows command line and FFmpeg output", det.includes("Command:") && det.includes("ffmpeg ") && det.includes("Verified:"), det.slice(0, 40));
+      await page.shot("06-completed.png");
+      for (const j of recJobs) {
+        try { rmSync(j.output, { force: true }); } catch {}
+      }
+    }
+  } else {
+    console.log("SKIP: user recording not found at", rec);
+  }
+
+  // ---- filename template + overwrite policy from the UI
+  await clickText(page, "[role=tab]", "Current");
+  await clickText(page, ".side [role=tab]", "Locations");
+  await sleep(300);
+  const setInput = (label, val) => page.eval(`(() => { const el=document.querySelector('[aria-label=${JSON.stringify(label)}]'); el.value=${JSON.stringify(val)}; el.dispatchEvent(new Event('change',{bubbles:true})); return el.value })()`);
+  await setInput("Output name template", "OUT_{name}_{preset}");
+  await setInput("If the output file already exists", "skip");
+  await sleep(500);
+  const st = (await inv(page, "get_settings")).v;
+  check("template and overwrite policy are saved from the UI", st.template === "OUT_{name}_{preset}" && st.overwrite === "skip", JSON.stringify(st));
+  const runWav = async () => {
+    const known = (await inv(page, "queue_list")).v.map((j) => j.id);
+    await page.eval(dragPayload([wav]));
+    await waitFor(async () => (await text(page)).includes("tone.wav"), 15000);
+    await sleep(500);
+    await clickText(page, ".primary", "Start batch");
+    return waitFor(async () => {
+      const js = (await inv(page, "queue_list")).v.filter((j) => !known.includes(j.id));
+      return js.length && js.every((j) => j.state === "done" || j.state === "failed") ? js[0] : false;
+    }, 60000);
+  };
+  const first = await runWav();
+  check("custom name template is used", first && first.state === "done" && first.output.endsWith("OUT_tone_aac-256.m4a"), first?.output);
+  const second = await runWav();
+  check("'skip' policy fails the job instead of overwriting", second && second.state === "failed" && /already exists/.test(second.error ?? ""), second?.error);
+  await setInput("If the output file already exists", "rename");
+  await sleep(400);
+  const third = await runWav();
+  check("'keep both' adds a number", third && third.state === "done" && third.output.endsWith("OUT_tone_aac-256 (1).m4a"), third?.output);
+  for (const j of [first, third]) { try { rmSync(j.output, { force: true }); } catch {} }
+  await setInput("Output name template", "{name}-{preset}");
+  await clickText(page, ".side [role=tab]", "Presets");
+  const ffv = await page.eval(`document.querySelector('.ffv')?.innerText ?? ''`);
+  check("footer shows the FFmpeg version", /FFmpeg \d/.test(ffv), ffv);
+
+  // ---- Active tab after a finished run + responsive + themes
+  await clickText(page, "[role=tab]", "Active");
+  await sleep(400);
+  const at2 = await text(page);
+  check("Active tab says the batch finished and links to results", at2.includes("Batch finished") && at2.includes("View results"), "");
+  await clickText(page, "[role=tab]", "Current");
+  for (const [w, h] of [[1000, 640], [960, 600], [1440, 900]]) {
+    await page.viewport(w, h);
+    await sleep(500);
+    const ov = await page.eval(`({ sw: document.documentElement.scrollWidth, iw: window.innerWidth, cw: document.querySelector('.center').getBoundingClientRect().width })`);
+    check(`no horizontal overflow and a usable centre at ${w}×${h}`, ov.sw <= ov.iw + 1 && ov.cw >= 340, JSON.stringify(ov));
+  }
+  const col = (sel) => page.eval(`getComputedStyle(document.querySelector(${JSON.stringify(sel)})).backgroundColor`);
+  const darkBg = await col(".top");
+  await page.scheme("light");
+  await sleep(300);
+  const lightBg = await col(".top");
+  await page.scheme("dark");
+  await sleep(200);
+  check("light and dark themes both apply", darkBg !== lightBg && lightBg === "rgb(246, 246, 246)", `${darkBg} / ${lightBg}`);
 
   // ---- cleanup queue
   await inv(page, "queue_cancel_all");

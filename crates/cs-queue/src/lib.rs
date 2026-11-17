@@ -1,7 +1,7 @@
 //! Persistent job queue: scheduler, worker threads, cancel/retry and the FFmpeg-backed encoder.
 
-use cs_ffmpeg::{build_args, plan_output, run_encode, temp_path, HwKind, Overwrite, PlanError, Preset, Progress, RunError};
-use cs_probe::validate_input;
+use cs_ffmpeg::{build_args_trim, plan_output, run_encode_logged, temp_path, verify_output, HwKind, Overwrite, PlanError, Preset, Progress, RunError, Trim, Verify};
+use cs_probe::{probe, validate_input};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,26 @@ pub struct Job {
     pub created_at: u64,
     /// Temp file being written (kept so a crash can be cleaned up at next start).
     pub temp: Option<String>,
+    /// In/out points applied to the source, seconds. `duration_secs` is the resulting length.
+    #[serde(default)]
+    pub start_secs: Option<f64>,
+    #[serde(default)]
+    pub end_secs: Option<f64>,
+    #[serde(default)]
+    pub source_size: Option<u64>,
+    #[serde(default)]
+    pub started_ms: Option<u64>,
+    #[serde(default)]
+    pub finished_ms: Option<u64>,
+    /// The exact ffmpeg command line used (for support and reproducibility).
+    #[serde(default)]
+    pub cmdline: Option<String>,
+    /// Last lines FFmpeg printed.
+    #[serde(default)]
+    pub log: Vec<String>,
+    /// What ffprobe found in the finished output compared with the preset.
+    #[serde(default)]
+    pub verify: Option<Verify>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +71,10 @@ pub struct NewJob {
     pub dest_dir: Option<String>,
     pub template: Option<String>,
     pub overwrite: Option<Overwrite>,
+    #[serde(default)]
+    pub start_secs: Option<f64>,
+    #[serde(default)]
+    pub end_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -92,6 +116,9 @@ pub enum Event {
 }
 
 pub enum Report {
+    Cmd(String),
+    Log(Vec<String>),
+    Verify(Verify),
     Temp(String),
     Progress(Progress),
     Note(String),
@@ -133,6 +160,40 @@ pub struct Queue {
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Validate in/out points and return the resulting length (when it can be known).
+pub fn effective_duration(source_secs: Option<f64>, start: Option<f64>, end: Option<f64>) -> Result<Option<f64>, String> {
+    for v in [start, end].into_iter().flatten() {
+        if !v.is_finite() || v < 0.0 {
+            return Err("in/out points must be positive numbers".into());
+        }
+    }
+    let s0 = start.unwrap_or(0.0);
+    if let Some(e) = end {
+        if e <= s0 {
+            return Err("the out point must be after the in point".into());
+        }
+        if let Some(d) = source_secs {
+            if e > d + 0.5 {
+                return Err("the out point is beyond the end of the file".into());
+            }
+        }
+    }
+    if let (Some(d), None) = (source_secs, end) {
+        if s0 >= d {
+            return Err("the in point is beyond the end of the file".into());
+        }
+    }
+    Ok(match (source_secs, end) {
+        (_, Some(e)) => Some(e - s0),
+        (Some(d), None) => Some(d - s0),
+        _ => None,
+    })
 }
 
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -199,6 +260,8 @@ impl Queue {
         new.preset.validate().map_err(|e| e.to_string())?;
         let src = validate_input(Path::new(&new.source)).map_err(|e| e.to_string())?;
         let template = new.template.unwrap_or_else(|| settings.template.clone());
+        let duration = effective_duration(new.duration_secs, new.start_secs, new.end_secs)?;
+        let source_size = std::fs::metadata(&src).ok().map(|m| m.len());
         let mut g = self.shared.inner.lock().unwrap();
         let id = g.next_id;
         g.next_id += 1;
@@ -206,7 +269,7 @@ impl Queue {
             id,
             file_name: src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
             source: src.to_string_lossy().into_owned(),
-            duration_secs: new.duration_secs,
+            duration_secs: duration,
             preset: new.preset,
             dest_dir: new.dest_dir.or_else(|| settings.default_dest.clone()),
             template,
@@ -222,6 +285,14 @@ impl Queue {
             attempt: 0,
             created_at: now(),
             temp: None,
+            start_secs: new.start_secs,
+            end_secs: new.end_secs,
+            source_size,
+            started_ms: None,
+            finished_ms: None,
+            cmdline: None,
+            log: vec![],
+            verify: None,
         };
         g.jobs.push(job.clone());
         self.persist(&g);
@@ -282,6 +353,10 @@ impl Queue {
                 j.fps = None;
                 j.speed = None;
                 j.eta_secs = None;
+                j.verify = None;
+                j.log.clear();
+                j.started_ms = None;
+                j.finished_ms = None;
                 changed = Some(j.clone());
             }
         }
@@ -370,6 +445,10 @@ fn dispatcher(shared: Arc<Shared>) {
                 g.jobs[idx].progress = 0.0;
                 g.jobs[idx].error = None;
                 g.jobs[idx].note = None;
+                g.jobs[idx].verify = None;
+                g.jobs[idx].log.clear();
+                g.jobs[idx].started_ms = Some(now_ms());
+                g.jobs[idx].finished_ms = None;
                 g.flags.insert(id, flag.clone());
                 let job = g.jobs[idx].clone();
                 persist(&shared, &g);
@@ -414,6 +493,9 @@ fn worker(shared: Arc<Shared>, job: Job, flag: Arc<AtomicBool>) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         shared.encoder.encode(&job, &flag, &mut |r| match r {
             Report::Temp(t) => update(&sh, id, |j| j.temp = Some(t), true),
+            Report::Cmd(c) => update(&sh, id, |j| j.cmdline = Some(c), false),
+            Report::Log(l) => update(&sh, id, |j| j.log = l, false),
+            Report::Verify(v) => update(&sh, id, |j| j.verify = Some(v), false),
             Report::Note(n) => update(&sh, id, |j| j.note = Some(n), false),
             Report::Progress(p) => update(
                 &sh,
@@ -438,6 +520,7 @@ fn worker(shared: Arc<Shared>, job: Job, flag: Arc<AtomicBool>) {
             j.fps = None;
             j.speed = None;
             j.eta_secs = None;
+            j.finished_ms = Some(now_ms());
             match result {
                 Ok(out) => {
                     j.state = JobState::Done;
@@ -461,15 +544,21 @@ fn worker(shared: Arc<Shared>, job: Job, flag: Arc<AtomicBool>) {
     shared.cv.notify_all();
 }
 
-/// Real encoder: runs FFmpeg with temp file + atomic rename, hardware first then software fallback.
+/// Real encoder: runs FFmpeg with temp file + atomic rename, hardware first then software fallback,
+/// then re-probes the finished file and checks it against the preset.
 pub struct FfmpegEncoder {
     pub ffmpeg: PathBuf,
+    pub ffprobe: Option<PathBuf>,
     pub hw: Arc<Mutex<Vec<HwKind>>>,
     pub settings: Arc<Mutex<Settings>>,
 }
 
 fn remove_quiet(p: &Path) {
     let _ = std::fs::remove_file(p);
+}
+
+fn quote(a: &str) -> String {
+    if a.contains(' ') || a.contains('\'') { format!("\"{a}\"") } else { a.to_string() }
 }
 
 impl Encoder for FfmpegEncoder {
@@ -494,18 +583,27 @@ impl Encoder for FfmpegEncoder {
                 _ => None,
             }
         };
+        report(Report::Note(match hw_kind {
+            Some(k) => format!("Encoding with {}", k.label()),
+            None => "Encoding in software (CPU)".into(),
+        }));
+        let trim = Trim { start: job.start_secs, end: job.end_secs };
         let attempt = |hw: Option<HwKind>, report: &mut dyn FnMut(Report)| {
-            let args = build_args(&job.preset, &src, &tmp, hw);
-            run_encode(&self.ffmpeg, &args, job.duration_secs, cancel, |p| report(Report::Progress(p)))
+            let args = build_args_trim(&job.preset, &src, &tmp, hw, trim);
+            report(Report::Cmd(format!("ffmpeg {}", args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" "))));
+            run_encode_logged(&self.ffmpeg, &args, job.duration_secs, cancel, |p| report(Report::Progress(p)))
         };
-        let mut res = attempt(hw_kind, report);
+        let (mut res, mut log) = attempt(hw_kind, report);
         if let (Err(RunError::Failed(m)), Some(k)) = (&res, hw_kind) {
             remove_quiet(&tmp);
             report(Report::Note(format!("{} failed ({}); retried in software", k.label(), m.chars().take(120).collect::<String>())));
-            res = attempt(None, report);
+            (res, log) = attempt(None, report);
         } else if let (Ok(()), Some(k)) = (&res, hw_kind) {
             report(Report::Note(format!("Encoded with {}", k.label())));
+        } else if res.is_ok() {
+            report(Report::Note("Encoded in software".into()));
         }
+        report(Report::Log(log));
         match res {
             Ok(()) => {
                 let size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
@@ -517,6 +615,14 @@ impl Encoder for FfmpegEncoder {
                     remove_quiet(&tmp);
                     RunError::Failed(format!("could not write output: {e}"))
                 })?;
+                if let Some(probe_tool) = &self.ffprobe {
+                    let src_audio = probe(probe_tool, &src).map(|i| i.audio.is_some()).unwrap_or(true);
+                    let v = match probe(probe_tool, &fin) {
+                        Ok(info) => verify_output(&info, &job.preset, job.duration_secs, src_audio),
+                        Err(e) => Verify { ok: false, notes: vec![format!("could not read the finished file: {e}")], ..Verify::default() },
+                    };
+                    report(Report::Verify(v));
+                }
                 Ok(fin.to_string_lossy().into_owned())
             }
             Err(e) => {
@@ -575,7 +681,7 @@ mod tests {
     }
 
     fn newjob(p: &Path) -> NewJob {
-        NewJob { source: p.to_string_lossy().into_owned(), duration_secs: Some(1.0), preset: builtin_presets().remove(0), dest_dir: None, template: None, overwrite: None }
+        NewJob { source: p.to_string_lossy().into_owned(), duration_secs: Some(1.0), preset: builtin_presets().remove(0), dest_dir: None, template: None, overwrite: None, start_secs: None, end_secs: None }
     }
 
     fn wait_for(q: &Queue, f: impl Fn(&[Job]) -> bool) {
@@ -687,6 +793,42 @@ mod tests {
         let mut nj = newjob(&fs[0]);
         nj.preset.container = "exe".into();
         assert!(q.add(nj, &Settings::default()).is_err());
+        q.shutdown();
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn trim_validation_and_effective_duration() {
+        assert_eq!(effective_duration(Some(10.0), None, None), Ok(Some(10.0)));
+        assert_eq!(effective_duration(Some(10.0), Some(2.0), Some(6.0)), Ok(Some(4.0)));
+        assert_eq!(effective_duration(Some(10.0), Some(2.0), None), Ok(Some(8.0)));
+        assert_eq!(effective_duration(None, Some(1.0), Some(4.0)), Ok(Some(3.0)));
+        assert_eq!(effective_duration(None, None, None), Ok(None));
+        assert!(effective_duration(Some(10.0), Some(6.0), Some(2.0)).is_err());
+        assert!(effective_duration(Some(10.0), None, Some(30.0)).is_err());
+        assert!(effective_duration(Some(10.0), Some(10.0), None).is_err());
+        assert!(effective_duration(Some(10.0), Some(f64::NAN), None).is_err());
+        assert!(effective_duration(Some(10.0), Some(-1.0), None).is_err());
+    }
+
+    #[test]
+    fn job_keeps_trimmed_length_for_progress() {
+        let (d, fs) = files(1, "trim");
+        let enc = Arc::new(Fake { running: AtomicUsize::new(0), peak: AtomicUsize::new(0), ms: 20, fail_names: vec![] });
+        let q = Queue::new(None, 1, enc, |_| {});
+        let mut nj = newjob(&fs[0]);
+        nj.duration_secs = Some(10.0);
+        nj.start_secs = Some(2.0);
+        nj.end_secs = Some(5.0);
+        let id = q.add(nj, &Settings::default()).unwrap();
+        let j = q.jobs().into_iter().find(|j| j.id == id).unwrap();
+        assert_eq!(j.duration_secs, Some(3.0));
+        assert_eq!(j.source_size, Some(1));
+        let mut bad = newjob(&fs[0]);
+        bad.duration_secs = Some(10.0);
+        bad.start_secs = Some(8.0);
+        bad.end_secs = Some(3.0);
+        assert!(q.add(bad, &Settings::default()).is_err());
         q.shutdown();
         let _ = std::fs::remove_dir_all(d);
     }

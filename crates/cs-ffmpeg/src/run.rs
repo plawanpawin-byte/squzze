@@ -80,7 +80,31 @@ pub fn run_encode(
     args: &[String],
     duration: Option<f64>,
     cancel: &AtomicBool,
+    on_progress: impl FnMut(Progress),
+) -> Result<(), RunError> {
+    run_encode_logged(ffmpeg, args, duration, cancel, on_progress).0
+}
+
+/// Like [`run_encode`] but also returns the last lines FFmpeg wrote to stderr (success or failure).
+pub fn run_encode_logged(
+    ffmpeg: &Path,
+    args: &[String],
+    duration: Option<f64>,
+    cancel: &AtomicBool,
     mut on_progress: impl FnMut(Progress),
+) -> (Result<(), RunError>, Vec<String>) {
+    let mut tail_out = Vec::new();
+    let r = run_inner(ffmpeg, args, duration, cancel, &mut on_progress, &mut tail_out);
+    (r, tail_out)
+}
+
+fn run_inner(
+    ffmpeg: &Path,
+    args: &[String],
+    duration: Option<f64>,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(Progress),
+    log_out: &mut Vec<String>,
 ) -> Result<(), RunError> {
     let mut cmd = Command::new(ffmpeg);
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -119,6 +143,7 @@ pub fn run_encode(
             let _ = child.kill();
             let _ = child.wait();
             let _ = (t_out.join(), t_err.join());
+            log_out.extend(tail.lock().unwrap().iter().cloned());
             return Err(RunError::Cancelled);
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -155,6 +180,7 @@ pub fn run_encode(
     }
     let status = child.wait().map_err(|e| RunError::Failed(e.to_string()))?;
     let _ = (t_out.join(), t_err.join());
+    log_out.extend(tail.lock().unwrap().iter().cloned());
     if status.success() {
         Ok(())
     } else {

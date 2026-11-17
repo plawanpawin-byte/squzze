@@ -24,17 +24,19 @@ The realistic attacker is **a malicious or malformed media file / preset file** 
 | Compromised web UI calling dangerous commands | Content-Security-Policy `default-src 'self'`, no remote content, no `eval`. Capability set is `core:default` only: **no filesystem, shell, HTTP or dialog permission is granted to the page**. File/folder pickers run in Rust. Commands accept preset *ids*, not command lines. | `app/src-tauri/tauri.conf.json`, `capabilities/` |
 | Opening arbitrary paths | `reveal_output` only accepts the id of a finished job and reveals that job's own output. | `app/src-tauri/src/lib.rs` |
 | Resource exhaustion | Batch probe ≤ 300 files, queue ≤ 5000 jobs, parallel jobs ≤ 4, ffprobe 30 s timeout, preview 15 s / 4 MB cap. | `app/src-tauri/src/lib.rs`, `cs-probe`, `cs-ffmpeg` |
+| Bad in/out points | Must be finite, non-negative, out after in and inside the file; validated again in the queue before FFmpeg starts. | `cs-queue::effective_duration` |
+| Output that silently differs from the preset | Every finished file is re-probed; codec, height limit, duration and audio presence are checked and shown to the user. | `cs-ffmpeg/src/verify.rs` |
 | Corrupt queue/settings files | Corrupt `queue.json` is set aside as `queue.corrupt.json`; invalid settings fall back to defaults and are clamped. | `cs-queue` |
 
 ## Verified in this repository
-* `cargo test` runs unit tests and integration tests against a real FFmpeg (all built-in presets are encoded and
-  re-probed; cancel, progress, corrupt input and hardware fallback are exercised).
+* `cargo test --workspace`: 44 tests including integration tests against a real FFmpeg (all built-in presets are encoded and
+  re-probed; cancel, progress, corrupt input, trimming and a real screen recording).
 * `cargo audit` (RustSec database, 1527 advisories, 478 crates): **0 vulnerabilities**. 6 informational warnings
   (unmaintained/unsound crates) remain in transitive Tauri dependencies: `glib`, `zbus_names`, `zvariant`,
   `zvariant_derive` are Linux-only and are not compiled into the Windows build; `chrono` and `proc-macro-error` are
   build-time/indirect. They are tracked and will go away as Tauri updates.
 * End-to-end test (`scripts/e2e.mjs`) drives the real installed-style exe through WebView2 DevTools: drop files, probe,
-  batch, cancel, crash-kill and restart, plus hostile inputs (URLs, relative paths, path-like preset ids, oversize
+  batch, trim, verification, settings, cancel, crash-kill and restart, resizable panels, light/dark themes, plus hostile inputs (URLs, relative paths, path-like preset ids, oversize
   batches) and web-layer isolation (CSP blocks outside network; `fs` and `shell` plugin commands denied by ACL).
 * `cargo clippy --workspace --all-targets`: 0 warnings.
 * `npm audit --omit=dev`: 0 vulnerabilities in the dependencies shipped inside the app.

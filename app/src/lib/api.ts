@@ -16,8 +16,8 @@ export const api = {
   pickFolder: () => invoke<string | null>("pick_folder"),
   probeFiles: (paths: string[]) => invoke<ProbeResult[]>("probe_files", { paths }),
   preview: (path: string, secs: number) => invoke<string>("preview", { path, secs }),
-  addJob: (source: string, presetId: string, destDir: string | null) =>
-    invoke<number>("add_job", { source, presetId, destDir }),
+  addJob: (source: string, presetId: string, destDir: string | null, startSecs: number | null = null, endSecs: number | null = null) =>
+    invoke<number>("add_job", { source, presetId, destDir, startSecs, endSecs }),
   queueList: () => invoke<Job[]>("queue_list"),
   queueStart: () => invoke<void>("queue_start"),
   queuePause: () => invoke<void>("queue_pause"),
@@ -37,8 +37,14 @@ export function onQueue(cb: (e: QueueEvent) => void): Promise<UnlistenFn> {
 export function onHwReady(cb: () => void): Promise<UnlistenFn> {
   return listen("hw-ready", () => cb());
 }
-export function onFileDrop(cb: (paths: string[]) => void): Promise<UnlistenFn> {
+export function onFileDrop(cb: (paths: string[]) => void, hover: (over: boolean) => void = () => {}): Promise<UnlistenFn> {
   return getCurrentWebview().onDragDropEvent((e) => {
-    if (e.payload.type === "drop") cb(e.payload.paths);
+    const t = e.payload.type;
+    if (t === "enter" || t === "over") hover(true);
+    else if (t === "leave") hover(false);
+    else if (t === "drop") {
+      hover(false);
+      cb(e.payload.paths);
+    }
   });
 }
